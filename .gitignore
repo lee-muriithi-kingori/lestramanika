@@ -3,11 +3,11 @@
 *.a
 *.so
 
-# Built binaries (the `pickle` source directory is un-ignored below so the
-# bare `/pickle` pattern only catches a same-named root-level binary).
+# Built binaries at the repo root (the `pickle` source tree lives under
+# `src/`, so these patterns only catch the executable artifacts).
 /pickle
+/pickle_*
 /pickle-*
-!/pickle/
 
 # Build directories
 build/

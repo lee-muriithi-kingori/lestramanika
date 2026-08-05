@@ -1,84 +1,175 @@
-# pickle
+# pickle — a from-scratch GGUF model loader and inference engine
 
-**pickle** is a from-scratch GGUF model loader and inference engine.
+> No llama.cpp. No ollama. No ggml. Pure C. Runs in the lestraOS kernel and on the host.
 
-- **No llama.cpp.** Zero lines of llama.cpp code. No vendored llama.cpp.
-- **No ollama.** Not a wrapper, not a fork, not a client. No ollama dependency.
-- **Pure C.** One language, one compiler, one toolchain.
-- **Freestanding core.** The model loader and inference engine (`pickle_core`)
-  depend on **no libc** and **no operating system**. It compiles to a freestanding
-  object you can link into anything — a userspace binary, a unikernel, or a
-  kernel module.
-- **Soft-float by default.** The numerical kernels use a portable software
-  floating-point path, so they run on targets where SSE/AVX are unavailable or
-  disabled — including ring-0 kernel code where SIMD is intentionally turned off
-  on Linux. A vectorised fast path is selected at build time when the host
-  advertises it.
-- **Host shim.** `pickle_host` is a thin POSIX shim that gives the freestanding
-  core `malloc`, `read`, `write`, and a clock. That is the entire host surface.
-
-> pickle is **work in progress.** It does not run a model end-to-end yet.
-> See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the version plan and
-> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the layering.
-
-## What is GGUF?
-
-[GGUF](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md) (GPT-Generated
-Unified Format) is the binary model container used by the modern GGML ecosystem.
-A GGUF file is a single key/value metadata header followed by a flat tensor
-table. Tensors are stored in a family of compact quantised formats (F32, F16,
-Q8_0, Q4_0, Q4_K, Q5_K, Q6_K, …) that let multi-billion-parameter models fit in
-a few gigabytes of RAM.
-
-pickle reads that container directly — parsing the header, decoding the tensor
-table, and dequantising tensors on demand — without any third-party GGUF code.
-
-## Why?
-
-Two reasons:
-
-1. **To prove it can be done cleanly.** GGUF and the surrounding quantisation
-   formats are small, well-specified, and self-contained. There is no reason
-   an inference engine needs to drag in megabytes of C++ and a GPU abstraction
-   layer. pickle aims to be a readable, single-tree implementation that a single
-   person can hold in their head.
-2. **To run inside a kernel.** Because `pickle_core` is freestanding and
-   soft-float, it can be linked into a kernel module and used to serve a small
-   language model from ring 0. That is the long-term target.
-
-## Layering
-
-```
-┌─────────────────────────────────────────────┐
-│  pickle_cli   — argument parsing, REPL, I/O  │  host-facing
-├─────────────────────────────────────────────┤
-│  pickle_host  — POSIX shim: malloc/read/write │  host-facing
-├─────────────────────────────────────────────┤
-│  pickle_core  — GGUF parse + dequant + math   │  freestanding
-└─────────────────────────────────────────────┘
-```
-
-- `pickle_core` is freestanding C. It calls no libc function. It does not know
-  what a file is. It accepts byte buffers and arena allocators.
-- `pickle_host` is the POSIX shim: it opens files, calls `mmap`/`read`,
-  provides `malloc`/`free`, and exposes a monotonic clock. It is the only layer
-  that knows about the operating system.
-- `pickle_cli` is the frontend: it parses argv, wires `pickle_host` to
-  `pickle_core`, and drives an interactive REPL or a one-shot generation.
-
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full breakdown.
+`pickle` is a tiny, self-contained GGUF (v3) parser + transformer
+forward-pass engine written in freestanding C. It does **not** depend on
+llama.cpp, ggml, ollama, or any other inference framework. The math is
+done with a built-in software float32 layer (`pickle_softfp.c`) so it
+runs even when the host CPU's FPU/SSE is unavailable — for example,
+inside the [lestraOS](https://github.com/lee-muriithi-kingori/LestraOS)
+kernel, which is built with `-mno-sse` and has no x87 init.
 
 ## Status
 
-**WIP — pre-release.** The current tree contains the skeleton only. The first
-working milestone (`v0.1`: GGUF parser + F32/F16/Q8_0/Q4_0 dequant) is the
-target of the initial development sprint. See
-[`docs/ROADMAP.md`](docs/ROADMAP.md).
+**alpha.** The Llama-family forward pass is verified end-to-end both
+in-kernel (lestraOS boot-time selftest, commit
+[`8d3300c`](https://github.com/lee-muriithi-kingori/LestraOS/commit/8d3300c)
+/ KE-28) and on the host (this repo's `./pickle selftest`).
+
+Supported tensor types:
+
+- **Full dequant:** F32, F16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1
+- **Simplified K-quants:** Q4_K, Q5_K, Q6_K, Q8_K, Q2_K, Q3_K
+
+Supported forward pass:
+
+- Llama-family (Llama, Llama 2, Llama 3, Mistral, Qwen2, Phi3-style):
+  RMSNorm, GQA attention with RoPE (NeoX), SwiGLU FFN, optional
+  logit softcapping, optional tied word embeddings.
+
+## Quick start
+
+```sh
+make                          # builds ./pickle (CLI) and ./pickle_selftest
+./pickle selftest             # runs the embedded selftest → "next token = 6"
+./pickle info model.gguf      # prints the architecture + first 12 tensors
+./pickle infer model.gguf "hello" 20   # generates 20 tokens from "hello"
+./pickle dequant model.gguf token_embd.weight   # first 32 floats of a tensor
+```
+
+If you don't have a `model.gguf` handy, regenerate the tiny demo model
+that `pickle selftest` uses:
+
+```sh
+python3 tools/make_tiny_gguf.py    # writes /tmp/pickle_demo.gguf + src/pickle_demo_gguf.c
+./pickle info /tmp/pickle_demo.gguf
+./pickle infer /tmp/pickle_demo.gguf "abc" 5
+```
+
+## Architecture
+
+Pickle is three layers:
+
+```
+ ┌──────────────────────────────────────────────────────────────┐
+ │  pickle_cli   (src/pickle_cli.c)                              │
+ │  — argv parsing, subcommands: selftest | info | infer | dequant │
+ ├──────────────────────────────────────────────────────────────┤
+ │  pickle_host  (src/pickle_host.c)              [host only]    │
+ │  — POSIX shim: FILE*-based pickle_io_t, malloc allocator,    │
+ │    pickle_load_from_file(), pickle_run_prompt() (char-level  │
+ │    tokenizer + greedy generation loop)                       │
+ ├──────────────────────────────────────────────────────────────┤
+ │  pickle_core  (src/pickle.c + src/pickle_softfp.c +           │
+ │                src/pickle.h)                                  │
+ │  — freestanding C, no libc, no syscalls. GGUF parse,         │
+ │    dequantize, Llama forward pass, greedy sampling. All math │
+ │    goes through sfp_t (uint32_t IEEE-754 bit patterns) and   │
+ │    the sfp_*() soft-float functions — NEVER C `float`        │
+ │    arithmetic, so it links into -mno-sse builds.             │
+ └──────────────────────────────────────────────────────────────┘
+```
+
+**The same `pickle.c` / `pickle_softfp.c` / `pickle.h` source compiles
+two ways:**
+
+- **In the lestraOS kernel** — with `-DPICKLE_KERNEL`. Then the
+  `#ifdef PICKLE_KERNEL` blocks at the top of each file pull in
+  `<lestra/types.h>`, `<lestra/printk.h>`, `<lestra/mm.h>` and the
+  kernel bump allocator is used. This is the in-kernel build at
+  lestraOS commit `8d3300c` (KE-28).
+- **On the host** (this repo) — with `-UPICKLE_KERNEL` (the default).
+  Then those `#ifdef` blocks pull in `<stdint.h>`, `<stdio.h>`,
+  `<stdlib.h>`, `<string.h>` instead, `pr_info` is `#define`'d to
+  `printf`, `kmalloc` to `malloc`, and so on. The POSIX shim
+  (`pickle_host.c`) provides `FILE*`-based `pickle_io_t` callbacks
+  and a `malloc`-based `pickle_alloc_t`.
+
+No glue or `#ifdef _HOST_` is needed inside the core files — the
+`PICKLE_KERNEL` toggle handles everything.
+
+### Repository layout
+
+```
+lestramanika/
+├── Makefile                       # builds ./pickle and ./pickle_selftest
+├── src/                           # the pickle engine source
+│   ├── pickle.h                   #   public API (freestanding)
+│   ├── pickle.c                   #   GGUF parse + Llama fwd pass
+│   ├── pickle_softfp.c            #   IEEE-754 soft float32
+│   ├── pickle_demo_gguf.c         #   embedded tiny GGUF (auto-generated)
+│   ├── pickle_host.c              #   POSIX shim (host only)
+│   ├── pickle_cli.c               #   CLI frontend (host only)
+│   └── pickle_selftest_main.c     #   tiny main() for ./pickle_selftest
+├── tools/
+│   └── make_tiny_gguf.py          # regenerates the embedded demo model
+└── docs/
+    ├── ARCHITECTURE.md
+    └── ROADMAP.md
+```
+
+> **Why does source live under `src/` rather than `pickle/`?** Because
+> the CLI binary is `./pickle` at the repo root, and a POSIX filesystem
+> cannot have both a `pickle/` directory and a `pickle` file at the same
+> level (a directory entry name is unique). Putting source under `src/`
+> lets the verification commands `./pickle selftest`, `./pickle info …`,
+> `./pickle infer …`, `./pickle dequant …` work exactly as written.
+
+## Why
+
+Because the lestraOS kernel disables SSE (`-mno-sse`) and has no x87
+init, so any `float` arithmetic would `#NM`/`#UD`. Pickle ships its own
+software float32 layer (`pickle_softfp.c`, ~370 lines of integer-only
+IEEE-754 binary32 add/sub/mul/div/exp/tanh/sigmoid/silu/gelu/sqrt/rsqrt/
+sin/cos) so it runs anywhere — kernel, embedded, anywhere.
+
+The same engine that boots inside the lestraOS kernel (verifying the
+GGUF parser and Llama forward pass at boot time, with no filesystem
+access, using an embedded 4 KB demo model) is the one you build with
+`make` here.
+
+## CLI reference
+
+```
+pickle selftest                         Run the embedded selftest
+pickle info <model.gguf>                Print model architecture + tensors
+pickle infer <model.gguf> "<prompt>" [N] Generate N tokens (default 20)
+pickle dequant <model.gguf> <tensor>    Print first 32 floats of <tensor>
+```
+
+Exit codes: `0` on success, `1` on error.
+
+The `infer` subcommand uses a **character-level tokenizer** for the demo
+model (each prompt byte becomes a token id, mod `vocab_size`). This is
+sufficient to exercise the forward pass end-to-end. A real BPE tokenizer
+is a v0.4 roadmap item.
+
+## Building from a fresh checkout
+
+Requirements: a C compiler (`cc`/`gcc`/`clang`), `make`, and Python 3
+(only if you want to regenerate the demo GGUF).
+
+```sh
+make clean && make
+make test    # builds + runs ./pickle_selftest and ./pickle selftest
+```
+
+`CFLAGS`, `LDFLAGS`, and `CC` are overridable on the make command line
+or via the environment.
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+MIT, Copyright (c) 2026 Lee Muriihi Kingori. See [LICENSE](LICENSE).
 
-## Author
+## Repo
 
-**Lee Muriihi Kingori** — lee-muriethi-kingori.
+- **This repo:** https://github.com/lee-muriithi-kingori/lestramanika
+
+## Related
+
+- **lestraOS:** https://github.com/lee-muriithi-kingori/LestraOS —
+  the OS where pickle runs in-kernel. The in-kernel half of this work
+  shipped as KE-28 (commit `8d3300c`): a boot-time selftest that parses
+  the embedded demo GGUF and runs one Llama forward pass, printing
+  `pickle: selftest OK, next token = 6` to the kernel console.
