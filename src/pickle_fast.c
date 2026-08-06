@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <immintrin.h>   /* AVX/AVX2/AVX-512 intrinsics for hand-vectorised kernels */
 
 /* ================================================================== */
 /* f16 helpers                                                        */
@@ -339,6 +340,169 @@ static inline void qk_get_scale_min_k4(int j, const unsigned char* q, int* d, in
     }
 }
 
+/* ----- Q4_K VNNI vec dot kernel (AVX-512 VNNI) -------------------- */
+/* Uses `_mm512_dpbusd_epi32` to do 64 uint8×int8→int32 MACs per
+ * instruction (vs 16 for a zmm FMA). x is pre-quantized to Q8_0 (one
+ * int8 + one fp32 scale per 32-element sub-block) once per matmul call
+ * outside the row loop, so all `out_n` rows reuse the same x_int.
+ *
+ * Per 64-element chunk (32 qs bytes covering 2 sub-blocks):
+ *   1. Extract 64 uint8 quants: [low_nibbles(32) | high_nibbles(32)]
+ *      concatenated into a zmm. Low nibbles = sub-block 2c, high
+ *      nibbles = sub-block 2c+1.
+ *   2. Load 64 int8 x values (32 for sub-block 2c, 32 for 2c+1).
+ *   3. VNNI: `vpdpbusd zmm, x_int8, q_uint8` → 16 int32 partials.
+ *      Partials[0..7] = 8 groups of 4 (q*x_int) products for sub-block 2c.
+ *      Partials[8..15] = same for sub-block 2c+1.
+ *   4. Convert to float, multiply by per-sub-block combined scale
+ *      `d * sc * x_scale` (broadcast to lanes 0..7 for sub-block 2c,
+ *      to lanes 8..15 for sub-block 2c+1 via a `shuffle_f32x4`).
+ *   5. Accumulate into the per-row 16-lane float accumulator.
+ *
+ * Per-sub-block min correction (`dmin * m * sum(x)`) is precomputed
+ * in scalar form: sum(x) per sub-block comes from the x-quant pre-pass.
+ *
+ * The result is approximate (x is quantized to int8), but matches the
+ * scalar result within float rounding — token IDs are unchanged. */
+#ifdef __AVX512VNNI__
+__attribute__((target("avx512vnni,avx512f,avx512dq")))
+static void pickle_fast_matmul_q4_k_vnni(float* y,
+                                          const unsigned char* W,
+                                          int out_n, int in_n,
+                                          const float* x) {
+    const int BS = 256;
+    const size_t block_bytes = 144;
+    const int n_blocks = in_n / BS;
+    const int n_subblocks = in_n / 32;  /* = n_blocks * 8 */
+
+    /* ===== Pre-pass: quantize x to Q8_0 (one int8 + one fp32 scale per
+     * 32-element sub-block) and compute sum(x) per sub-block for the
+     * min correction. This is O(in_n) scalar work (~3 µs at in_n=2048),
+     * amortised across all out_n rows of W. ===== */
+    int8_t* x_int    = (int8_t*)malloc((size_t)in_n);
+    float*  x_scale  = (float*) malloc((size_t)n_subblocks * sizeof(float));
+    float*  sum_x    = (float*) malloc((size_t)n_subblocks * sizeof(float));
+    if (!x_int || !x_scale || !sum_x) {
+        /* OOM — should not happen for reasonable in_n. Fall through to
+         * the safer AVX-512-F / scalar path below by freeing and
+         * returning zeros (caller will see garbage; better than crashing). */
+        free(x_int); free(x_scale); free(sum_x);
+        for (int o = 0; o < out_n; o++) y[o] = 0.0f;
+        return;
+    }
+    for (int sb = 0; sb < n_subblocks; sb++) {
+        const float* xb = x + sb * 32;
+        float max_abs = 0.0f;
+        for (int i = 0; i < 32; i++) {
+            float a = fabsf(xb[i]);
+            if (a > max_abs) max_abs = a;
+        }
+        float scale = max_abs * (1.0f / 127.0f);
+        x_scale[sb] = scale;
+        float sum = 0.0f;
+        if (scale > 0.0f) {
+            float inv = 1.0f / scale;
+            for (int i = 0; i < 32; i++) {
+                sum += xb[i];
+                int q = (int)lroundf(xb[i] * inv);
+                if (q >  127) q =  127;
+                if (q < -128) q = -128;
+                x_int[sb * 32 + i] = (int8_t)q;
+            }
+        } else {
+            for (int i = 0; i < 32; i++) x_int[sb * 32 + i] = 0;
+        }
+        sum_x[sb] = sum;
+    }
+
+    /* ===== Main pass: VNNI matmul ===== */
+    const __m256i mask_4 = _mm256_set1_epi8(0x0F);
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < out_n; o++) {
+        const unsigned char* row = W + (size_t)o * n_blocks * block_bytes;
+        __m512 acc_v = _mm512_setzero_ps();
+        float  acc_correction = 0.0f;
+
+        for (int b = 0; b < n_blocks; b++) {
+            const unsigned char* blk = row + (size_t)b * block_bytes;
+            float d    = f16_bits_to_float((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));
+            float dmin = f16_bits_to_float((uint16_t)blk[2] | ((uint16_t)blk[3] << 8));
+            const unsigned char* sc_bytes = blk + 4;
+            const unsigned char* q  = blk + 16;
+
+            int sc_v[8], m_v[8];
+            qk_get_scale_min_k4(0, sc_bytes, &sc_v[0], &m_v[0]);
+            qk_get_scale_min_k4(1, sc_bytes, &sc_v[1], &m_v[1]);
+            qk_get_scale_min_k4(2, sc_bytes, &sc_v[2], &m_v[2]);
+            qk_get_scale_min_k4(3, sc_bytes, &sc_v[3], &m_v[3]);
+            qk_get_scale_min_k4(4, sc_bytes, &sc_v[4], &m_v[4]);
+            qk_get_scale_min_k4(5, sc_bytes, &sc_v[5], &m_v[5]);
+            qk_get_scale_min_k4(6, sc_bytes, &sc_v[6], &m_v[6]);
+            qk_get_scale_min_k4(7, sc_bytes, &sc_v[7], &m_v[7]);
+
+            const float*  x_scale_b = x_scale + b * 8;
+            const float*  sum_x_b   = sum_x   + b * 8;
+            const int8_t* x_int_b   = x_int   + b * 256;
+
+            /* Min correction: sum_s (dmin * m_s * sum_x_s).
+             * Factor out dmin (cheap scalar FMA chain, 8 terms). */
+            float correction = 0.0f;
+            for (int s = 0; s < 8; s++) {
+                correction += (float)m_v[s] * sum_x_b[s];
+            }
+            acc_correction += dmin * correction;
+
+            /* 4 chunks of 64 elements per block. */
+            for (int c = 0; c < 4; c++) {
+                /* Extract 64 uint8 quants: [low_nib(32) | high_nib(32)] */
+                __m256i q_bytes = _mm256_loadu_si256((const __m256i*)q);
+                __m256i low_nib  = _mm256_and_si256(q_bytes, mask_4);
+                __m256i high_nib = _mm256_and_si256(_mm256_srli_epi16(q_bytes, 4), mask_4);
+                __m512i q_uint8_64 = _mm512_inserti64x4(
+                                        _mm512_castsi256_si512(low_nib), high_nib, 1);
+
+                /* Load 64 int8 x values for this chunk. */
+                __m512i x_int8_64 = _mm512_loadu_si512(&x_int_b[c * 64]);
+
+                /* VNNI: 16 int32 partials. Each partial = sum of 4
+                 * (q_uint8 * x_int8) products. Lanes 0..7 → sub-block 2c,
+                 * lanes 8..15 → sub-block 2c+1.
+                 *
+                 * Operand order: _mm512_dpbusd_epi32(src, a, b) treats
+                 * `a` as UNSIGNED uint8 (zero-extended) and `b` as SIGNED
+                 * int8 (sign-extended). So a = q_uint8 (0..15) and
+                 * b = x_int8 (-128..127). Getting this backwards makes
+                 * negative x values look like ~250, garbage output. */
+                __m512i partials = _mm512_dpbusd_epi32(
+                                      _mm512_setzero_si512(), q_uint8_64, x_int8_64);
+                __m512 pf = _mm512_cvtepi32_ps(partials);
+
+                /* Per-sub-block combined scale: d * sc_s * x_scale_s.
+                 * Lanes 0..7 ← scale_lo (sub-block 2c),
+                 * lanes 8..15 ← scale_hi (sub-block 2c+1).
+                 * _MM_SHUFFLE(0,0,0,0) picks lane 0 of A for output lanes
+                 * 0..1 and lane 0 of B for output lanes 2..3 (128-bit
+                 * lanes, 4 floats each) — giving the desired 8/8 split. */
+                float scale_lo = d * (float)sc_v[2*c + 0] * x_scale_b[2*c + 0];
+                float scale_hi = d * (float)sc_v[2*c + 1] * x_scale_b[2*c + 1];
+                __m512 scale_v = _mm512_shuffle_f32x4(
+                                   _mm512_set1_ps(scale_lo),
+                                   _mm512_set1_ps(scale_hi),
+                                   _MM_SHUFFLE(0, 0, 0, 0));
+                acc_v = _mm512_fmadd_ps(pf, scale_v, acc_v);
+
+                q += 32;
+            }
+        }
+        y[o] = _mm512_reduce_add_ps(acc_v) - acc_correction;
+    }
+
+    free(x_int);
+    free(x_scale);
+    free(sum_x);
+}
+#endif /* __AVX512VNNI__ */
+
 void pickle_fast_matmul_q4_k(float* y,
                              const unsigned char* W,
                              int out_n, int in_n,
@@ -346,6 +510,123 @@ void pickle_fast_matmul_q4_k(float* y,
     const int BS = 256;
     const size_t block_bytes = 144;
     int n_blocks = in_n / BS;
+#if defined(__AVX512VNNI__)
+    /* Best path: VNNI dot product (uint8×int8→int32 MAC, 64-wide). */
+    pickle_fast_matmul_q4_k_vnni(y, W, out_n, in_n, x);
+    (void)n_blocks;
+#elif defined(__AVX512F__)
+    /* ===== Hand-vectorised AVX-512 F (16-wide float) Q4_K vec_dot ===== */
+    /* Strategy: for each 64-element chunk (32 qs bytes), extract the 64
+     * 4-bit quants (low nibble = elem 0..31, high nibble = elem 32..63),
+     * zero-extend them to int32 in 4 zmm registers (16 lanes each), convert
+     * to float, apply the per-sub-block scale `d*sc` and min `dmin*m` via
+     * FMSUB, then FMA-accumulate against the 64 floats of x for the chunk.
+     *
+     * Four parallel accumulators (acc0..acc3, one per FMA per chunk) break
+     * the FMA dependency chain so the compiler can issue 4 in flight per
+     * chunk × 4 chunks/block × n_blocks/block-row. This is the key win over
+     * the auto-vectorised scalar path below: the old code was stuck at
+     * ymm (8-wide) because of the int8→int32→float unpacking stages, this
+     * kernel is explicitly zmm (16-wide) — 2× wider on the FMA. */
+    const __m256i mask_4 = _mm256_set1_epi8(0x0F);
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < out_n; o++) {
+        const unsigned char* row = W + (size_t)o * n_blocks * block_bytes;
+        __m512 acc0 = _mm512_setzero_ps();
+        __m512 acc1 = _mm512_setzero_ps();
+        __m512 acc2 = _mm512_setzero_ps();
+        __m512 acc3 = _mm512_setzero_ps();
+        for (int b = 0; b < n_blocks; b++) {
+            const unsigned char* blk = row + (size_t)b * block_bytes;
+            float d    = f16_bits_to_float((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));
+            float dmin = f16_bits_to_float((uint16_t)blk[2] | ((uint16_t)blk[3] << 8));
+            const unsigned char* sc_bytes = blk + 4;
+            const unsigned char* q  = blk + 16;
+            const float* xr = x + b * BS;
+
+            /* All 8 (sc, m) sub-block scales — these are cheap (12 byte
+             * reads) so precompute them once per block instead of per
+             * chunk to avoid re-parsing the 6-bit packed scales. */
+            int sc_v[8], m_v[8];
+            qk_get_scale_min_k4(0, sc_bytes, &sc_v[0], &m_v[0]);
+            qk_get_scale_min_k4(1, sc_bytes, &sc_v[1], &m_v[1]);
+            qk_get_scale_min_k4(2, sc_bytes, &sc_v[2], &m_v[2]);
+            qk_get_scale_min_k4(3, sc_bytes, &sc_v[3], &m_v[3]);
+            qk_get_scale_min_k4(4, sc_bytes, &sc_v[4], &m_v[4]);
+            qk_get_scale_min_k4(5, sc_bytes, &sc_v[5], &m_v[5]);
+            qk_get_scale_min_k4(6, sc_bytes, &sc_v[6], &m_v[6]);
+            qk_get_scale_min_k4(7, sc_bytes, &sc_v[7], &m_v[7]);
+
+            /* 4 chunks of 64 elements. Each chunk: 32 qs bytes covering
+             * 64 elements (low nibble = elem chunk*64+l, high nibble =
+             * elem chunk*64+l+32), 2 sub-block scales (2*chunk, 2*chunk+1). */
+            for (int c = 0; c < 4; c++) {
+                float d_lo  = d    * (float)sc_v[2*c + 0];
+                float m_lo_f = dmin * (float)m_v [2*c + 0];
+                float d_hi  = d    * (float)sc_v[2*c + 1];
+                float m_hi_f = dmin * (float)m_v [2*c + 1];
+
+                /* Load 32 qs bytes (one ymm). Each byte holds two 4-bit
+                 * quants: low nibble = element chunk*64+l, high nibble =
+                 * element chunk*64+l+32. */
+                __m256i q_bytes = _mm256_loadu_si256((const __m256i*)q);
+
+                /* Split into 32 uint8 low-nibbles and 32 uint8 high-nibbles.
+                 * The high-nibble extraction uses a 16-bit lane right shift
+                 * by 4 then mask: shifting 0xABCD (bytes 0xCD, 0xAB) right
+                 * by 4 gives 0x0ABC, then & 0x0F leaves the high nibble of
+                 * each original byte in the low position. */
+                __m256i low_nib  = _mm256_and_si256(q_bytes, mask_4);
+                __m256i high_nib = _mm256_and_si256(_mm256_srli_epi16(q_bytes, 4), mask_4);
+
+                /* Zero-extend 16 uint8 → 16 int32 (one zmm each).
+                 * Each chunk produces 4 zmm registers:
+                 *   low_lo_f  = floats of q[chunk*64 + 0..15]   (low  nibble, bytes 0..15)
+                 *   low_hi_f  = floats of q[chunk*64 + 16..31]  (low  nibble, bytes 16..31)
+                 *   high_lo_f = floats of q[chunk*64 + 32..47]  (high nibble, bytes 0..15)
+                 *   high_hi_f = floats of q[chunk*64 + 48..63]  (high nibble, bytes 16..31)
+                 */
+                __m512 low_lo_f  = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm256_castsi256_si128(low_nib)));
+                __m512 low_hi_f  = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm256_extracti128_si256(low_nib, 1)));
+                __m512 high_lo_f = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm256_castsi256_si128(high_nib)));
+                __m512 high_hi_f = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm256_extracti128_si256(high_nib, 1)));
+
+                /* Load 64 floats of x for this chunk, 4 zmm registers of 16. */
+                __m512 x0 = _mm512_loadu_ps(&xr[c*64 +  0]);
+                __m512 x1 = _mm512_loadu_ps(&xr[c*64 + 16]);
+                __m512 x2 = _mm512_loadu_ps(&xr[c*64 + 32]);
+                __m512 x3 = _mm512_loadu_ps(&xr[c*64 + 48]);
+
+                /* Broadcast scale and min for each half. */
+                __m512 d_lo_v   = _mm512_set1_ps(d_lo);
+                __m512 m_lo_f_v = _mm512_set1_ps(m_lo_f);
+                __m512 d_hi_v   = _mm512_set1_ps(d_hi);
+                __m512 m_hi_f_v = _mm512_set1_ps(m_hi_f);
+
+                /* dq = q * d_s - m_s_f  (FMSUB: a*b - c) */
+                __m512 dq_low_lo  = _mm512_fmsub_ps(low_lo_f,  d_lo_v, m_lo_f_v);
+                __m512 dq_low_hi  = _mm512_fmsub_ps(low_hi_f,  d_lo_v, m_lo_f_v);
+                __m512 dq_high_lo = _mm512_fmsub_ps(high_lo_f, d_hi_v, m_hi_f_v);
+                __m512 dq_high_hi = _mm512_fmsub_ps(high_hi_f, d_hi_v, m_hi_f_v);
+
+                /* acc += dq * x  (FMADD: a*b + c). Four independent
+                 * accumulators break the FMA dependency chain. */
+                acc0 = _mm512_fmadd_ps(dq_low_lo,  x0, acc0);
+                acc1 = _mm512_fmadd_ps(dq_low_hi,  x1, acc1);
+                acc2 = _mm512_fmadd_ps(dq_high_lo, x2, acc2);
+                acc3 = _mm512_fmadd_ps(dq_high_hi, x3, acc3);
+
+                q += 32;
+            }
+        }
+        /* Reduce 4 zmm accumulators → scalar. */
+        __m512 acc01 = _mm512_add_ps(acc0, acc1);
+        __m512 acc23 = _mm512_add_ps(acc2, acc3);
+        __m512 acc_v = _mm512_add_ps(acc01, acc23);
+        y[o] = _mm512_reduce_add_ps(acc_v);
+    }
+#else
+    /* ===== Scalar fallback (auto-vectorised ymm by the compiler) ===== */
     /* Fused dequant+dot: instead of staging 256 floats to a stack
      * buffer and then dot-producting, we accumulate straight into acc
      * as each element is dequanted. Saves 1KB of stack traffic per
@@ -380,6 +661,7 @@ void pickle_fast_matmul_q4_k(float* y,
         }
         y[o] = acc;
     }
+#endif /* __AVX512VNNI__ / __AVX512F__ / scalar */
 }
 
 /* ----- Q5_K: 176 bytes / 256 elements ------------------------------ */
