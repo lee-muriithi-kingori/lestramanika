@@ -23,7 +23,11 @@
 #include <stdio.h>
 #define pr_info(...)  do {} while (0)
 #endif
+#ifdef PICKLE_KERNEL
+#include <lestra/pickle.h>
+#else
 #include "pickle.h"
+#endif
 
 /* ---- bit layout helpers ------------------------------------------- */
 #define SFP_SIGN_BITS  0x80000000u

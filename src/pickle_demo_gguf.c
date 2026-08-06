@@ -7,7 +7,11 @@
 #else
 #include <stdint.h>
 #endif
+#ifdef PICKLE_KERNEL
+#include <lestra/pickle.h>
+#else
 #include "pickle.h"
+#endif
 
 const unsigned char pickle_demo_gguf[] = {
     0x47, 0x47, 0x55, 0x46, 0x03, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00,

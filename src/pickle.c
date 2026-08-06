@@ -47,7 +47,11 @@
 #define kmemset   memset
 #define kmemcpy   memcpy
 #endif
+#ifdef PICKLE_KERNEL
+#include <lestra/pickle.h>
+#else
 #include "pickle.h"
+#endif
 
 /* ================================================================== */
 /* Default allocator                                                  */
