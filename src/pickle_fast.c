@@ -724,6 +724,282 @@ void pickle_fast_matmul_q5_k(float* y,
     }
 }
 
+/* ----- Q6_K VNNI vec dot kernel (AVX-512 VNNI) -------------------- */
+/* Approach A (split unsigned accumulation):
+ *
+ * Q6_K quants are 6-bit unsigned (0..63). The dequant formula is
+ *   dq[i] = d * scales[i/16] * (q[i] - 32)
+ * which is signed after the -32 offset. VNNI's `vpdpbusd` does
+ * uint8×int8→int32 MACs, so we can't directly feed it signed quants.
+ *
+ * Solution: keep q UNSIGNED (0..63) for the VNNI dot, then subtract
+ * the constant offset separately:
+ *   sum_i (q[i] - 32) * x[i] = sum_i q[i]*x[i] - 32 * sum_i x[i]
+ *
+ * With x pre-quantized to Q8_0 (one int8 + one fp32 scale per 32-element
+ * sub-block), x[i] ≈ x_int[i] * x_scale[i/32], so:
+ *   dot ≈ d * sum_i scales[i/16] * x_scale[i/32] * q[i] * x_int[i]   (VNNI)
+ *         - 32 * d * sum_i scales[i/16] * x_scale[i/32] * x_int[i]   (corr.)
+ *
+ * The correction term needs sum(x_int) per 16-element sub-block (since
+ * scales are per 16 elements); we precompute that in the x-quant pass.
+ *
+ * Per 64-element half-chunk (2 sub-blocks-of-32 = 4 sub-blocks-of-16):
+ *   1. Extract 64 6-bit quants from ql[chunk*64 + 0..63] (low/high nibble
+ *      based on which half-chunk) and qh[chunk*32 + 0..31] (2 bits per
+ *      sub-block, shift = 4*hc + 2*sub_within_halfchunk).
+ *      q = ql_nibble | (qh_bits << 4), range 0..63.
+ *   2. Concatenate the 32 quants for sub 2*hc and the 32 for sub 2*hc+1
+ *      into a zmm as [sub_2hc(32) | sub_2hc+1(32)] via inserti64x4.
+ *   3. Load 64 int8 x values for this half-chunk.
+ *   4. VNNI: `vpdpbusd zmm, q_uint8, x_int8` → 16 int32 partials.
+ *      Lanes 0..3   = sub 2*hc, first  16 elements (scale scales[8c+4hc+0])
+ *      Lanes 4..7   = sub 2*hc, second 16 elements (scale scales[8c+4hc+1])
+ *      Lanes 8..11  = sub 2*hc+1, first  16 elements (scale scales[8c+4hc+2])
+ *      Lanes 12..15 = sub 2*hc+1, second 16 elements (scale scales[8c+4hc+3])
+ *   5. Convert to float, multiply by per-sub-block-of-16 combined scale
+ *      `d * scales[s] * x_scale[xs]` (4 different scales, each broadcast
+ *      to a 4-lane quarter of the zmm via insertf32x4).
+ *   6. FMA into the per-row 16-lane float accumulator.
+ *
+ * Per-block -32 correction is computed in scalar form (16 scalar FMAs
+ * per block) using the precomputed sum(x_int) per 16-element sub-block. */
+#ifdef __AVX512VNNI__
+__attribute__((target("avx512vnni,avx512f,avx512dq")))
+static void pickle_fast_matmul_q6_k_vnni(float* y,
+                                         const unsigned char* W,
+                                         int out_n, int in_n,
+                                         const float* x) {
+    const int BS = 256;
+    const size_t block_bytes = 210;
+    const int n_blocks = in_n / BS;
+    const int n_subblocks_32 = in_n / 32;  /* Q8_0 sub-blocks (32 elts each) */
+    const int n_subblocks_16 = in_n / 16;  /* Q6_K scale sub-blocks (16 elts) */
+
+    /* ===== Pre-pass: quantize x to Q8_0 (one int8 + one fp32 scale per
+     * 32-element sub-block), and precompute sum(x_int) per 16-element
+     * sub-block for the -32 correction. O(in_n) scalar work, amortised
+     * across all out_n rows of W. ===== */
+    int8_t*  x_int   = (int8_t*) malloc((size_t)in_n);
+    float*   x_scale = (float*)  malloc((size_t)n_subblocks_32 * sizeof(float));
+    int32_t* sum_x16 = (int32_t*)malloc((size_t)n_subblocks_16 * sizeof(int32_t));
+    if (!x_int || !x_scale || !sum_x16) {
+        free(x_int); free(x_scale); free(sum_x16);
+        for (int o = 0; o < out_n; o++) y[o] = 0.0f;
+        return;
+    }
+    for (int sb32 = 0; sb32 < n_subblocks_32; sb32++) {
+        const float* xb = x + sb32 * 32;
+        float max_abs = 0.0f;
+        for (int i = 0; i < 32; i++) {
+            float a = fabsf(xb[i]);
+            if (a > max_abs) max_abs = a;
+        }
+        float scale = max_abs * (1.0f / 127.0f);
+        x_scale[sb32] = scale;
+        if (scale > 0.0f) {
+            float inv = 1.0f / scale;
+            for (int i = 0; i < 32; i++) {
+                int q = (int)lroundf(xb[i] * inv);
+                if (q >  127) q =  127;
+                if (q < -128) q = -128;
+                x_int[sb32 * 32 + i] = (int8_t)q;
+            }
+        } else {
+            for (int i = 0; i < 32; i++) x_int[sb32 * 32 + i] = 0;
+        }
+    }
+    for (int sb16 = 0; sb16 < n_subblocks_16; sb16++) {
+        const int8_t* p = x_int + sb16 * 16;
+        int32_t s = 0;
+        for (int i = 0; i < 16; i++) s += p[i];
+        sum_x16[sb16] = s;
+    }
+
+    /* ===== Main pass: VNNI matmul ===== */
+    const __m256i mask_4 = _mm256_set1_epi8(0x0F);
+    const __m256i mask_2 = _mm256_set1_epi8(0x03);
+    /* Index to duplicate each of 8 x_scale values into pairs of 16 lanes:
+     * [x0,x0,x1,x1,...,x7,x7] from [x0,x1,...,x7]. Used by the vectorised
+     * -32 correction (x_scale applies to 32-element sub-blocks = 2 of the
+     * 16-element Q6_K scale sub-blocks, so each x_scale is used twice). */
+    const __m512i dup_idx = _mm512_setr_epi32(0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7);
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < out_n; o++) {
+        const unsigned char* row = W + (size_t)o * n_blocks * block_bytes;
+        /* 4 independent accumulators (one per half-chunk per block) to break
+         * the FMA dependency chain — 4 half-chunks per block, each updating
+         * its own acc, so 4 FMAs are in flight per block instead of 1. */
+        __m512 acc0 = _mm512_setzero_ps();  /* c=0, hc=0 */
+        __m512 acc1 = _mm512_setzero_ps();  /* c=0, hc=1 */
+        __m512 acc2 = _mm512_setzero_ps();  /* c=1, hc=0 */
+        __m512 acc3 = _mm512_setzero_ps();  /* c=1, hc=1 */
+        float  acc_correction = 0.0f;
+
+        for (int b = 0; b < n_blocks; b++) {
+            const unsigned char* blk = row + (size_t)b * block_bytes;
+            const unsigned char* ql     = blk;
+            const unsigned char* qh     = blk + 128;
+            const signed char*   scales = (const signed char*)(blk + 192);
+            float d = f16_bits_to_float((uint16_t)blk[208] | ((uint16_t)blk[209] << 8));
+
+            const int8_t*  x_int_b   = x_int   + b * 256;
+            const float*   x_scale_b = x_scale + b * 8;
+            const int32_t* sum_x16_b = sum_x16 + b * 16;
+
+            /* Vectorised -32 correction for all 16 sub-blocks-of-16 in this
+             * block. Replaces a 16-iteration scalar FMA loop with ~8 zmm
+             * instructions + 1 reduce.
+             *
+             * corr[sb16] = -32 * d * scales[sb16] * x_scale[sb16/2] * sum_x16[sb16]
+             * acc_correction += sum(corr[0..15]) */
+            __m512i scales_i32 = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i*)scales));
+            __m512  scales_f   = _mm512_cvtepi32_ps(scales_i32);
+            __m256  x_scale_8  = _mm256_loadu_ps(x_scale_b);
+            __m512  x_scale_v  = _mm512_permutexvar_ps(dup_idx,
+                                                       _mm512_castps256_ps512(x_scale_8));
+            __m512i sum_x_i32  = _mm512_loadu_si512(sum_x16_b);
+            __m512  sum_x_f    = _mm512_cvtepi32_ps(sum_x_i32);
+            __m512  corr_v     = _mm512_mul_ps(scales_f, x_scale_v);
+            corr_v = _mm512_mul_ps(corr_v, sum_x_f);
+            acc_correction += _mm512_reduce_add_ps(corr_v) * (-32.0f * d);
+
+            /* 2 chunks of 128 elements, each chunk has 2 half-chunks of 64.
+             * Manually unrolled over (c, hc) so each half-chunk targets its
+             * own accumulator, breaking the FMA dependency chain. */
+            /* --- half-chunk 0: c=0, hc=0 → acc0 --- */
+            {
+                const int c = 0, hc = 0;
+                __m256i ql_lo = _mm256_loadu_si256((const __m256i*)(ql + c*64 +  0));
+                __m256i ql_hi = _mm256_loadu_si256((const __m256i*)(ql + c*64 + 32));
+                __m256i ql_sub0 = _mm256_and_si256(ql_lo, mask_4);
+                __m256i ql_sub1 = _mm256_and_si256(ql_hi, mask_4);
+                __m256i qh_v = _mm256_loadu_si256((const __m256i*)(qh + c*32));
+                __m256i qh_sub0 = _mm256_and_si256(_mm256_srli_epi16(qh_v, 0), mask_2);
+                __m256i qh_sub1 = _mm256_and_si256(_mm256_srli_epi16(qh_v, 2), mask_2);
+                qh_sub0 = _mm256_slli_epi16(qh_sub0, 4);
+                qh_sub1 = _mm256_slli_epi16(qh_sub1, 4);
+                __m256i q_sub0 = _mm256_or_si256(ql_sub0, qh_sub0);
+                __m256i q_sub1 = _mm256_or_si256(ql_sub1, qh_sub1);
+                __m512i q_uint8_64 = _mm512_inserti64x4(
+                                        _mm512_castsi256_si512(q_sub0), q_sub1, 1);
+                __m512i x_int8_64 = _mm512_loadu_si512(&x_int_b[c*128 + hc*64]);
+                __m512i partials = _mm512_dpbusd_epi32(
+                                      _mm512_setzero_si512(), q_uint8_64, x_int8_64);
+                __m512 pf = _mm512_cvtepi32_ps(partials);
+                int s0 = scales[8*c + 4*hc + 0], s1 = scales[8*c + 4*hc + 1];
+                int s2 = scales[8*c + 4*hc + 2], s3 = scales[8*c + 4*hc + 3];
+                float xs0 = x_scale_b[4*c + 2*hc + 0];
+                float xs1 = x_scale_b[4*c + 2*hc + 1];
+                __m512 scale_v = _mm512_set1_ps(d * (float)s0 * xs0);
+                scale_v = _mm512_insertf32x4(scale_v, _mm_set1_ps(d * (float)s1 * xs0), 1);
+                scale_v = _mm512_insertf32x4(scale_v, _mm_set1_ps(d * (float)s2 * xs1), 2);
+                scale_v = _mm512_insertf32x4(scale_v, _mm_set1_ps(d * (float)s3 * xs1), 3);
+                acc0 = _mm512_fmadd_ps(pf, scale_v, acc0);
+            }
+            /* --- half-chunk 1: c=0, hc=1 → acc1 --- */
+            {
+                const int c = 0, hc = 1;
+                __m256i ql_lo = _mm256_loadu_si256((const __m256i*)(ql + c*64 +  0));
+                __m256i ql_hi = _mm256_loadu_si256((const __m256i*)(ql + c*64 + 32));
+                __m256i ql_sub0 = _mm256_and_si256(_mm256_srli_epi16(ql_lo, 4), mask_4);
+                __m256i ql_sub1 = _mm256_and_si256(_mm256_srli_epi16(ql_hi, 4), mask_4);
+                __m256i qh_v = _mm256_loadu_si256((const __m256i*)(qh + c*32));
+                __m256i qh_sub0 = _mm256_and_si256(_mm256_srli_epi16(qh_v, 4), mask_2);
+                __m256i qh_sub1 = _mm256_and_si256(_mm256_srli_epi16(qh_v, 6), mask_2);
+                qh_sub0 = _mm256_slli_epi16(qh_sub0, 4);
+                qh_sub1 = _mm256_slli_epi16(qh_sub1, 4);
+                __m256i q_sub0 = _mm256_or_si256(ql_sub0, qh_sub0);
+                __m256i q_sub1 = _mm256_or_si256(ql_sub1, qh_sub1);
+                __m512i q_uint8_64 = _mm512_inserti64x4(
+                                        _mm512_castsi256_si512(q_sub0), q_sub1, 1);
+                __m512i x_int8_64 = _mm512_loadu_si512(&x_int_b[c*128 + hc*64]);
+                __m512i partials = _mm512_dpbusd_epi32(
+                                      _mm512_setzero_si512(), q_uint8_64, x_int8_64);
+                __m512 pf = _mm512_cvtepi32_ps(partials);
+                int s0 = scales[8*c + 4*hc + 0], s1 = scales[8*c + 4*hc + 1];
+                int s2 = scales[8*c + 4*hc + 2], s3 = scales[8*c + 4*hc + 3];
+                float xs0 = x_scale_b[4*c + 2*hc + 0];
+                float xs1 = x_scale_b[4*c + 2*hc + 1];
+                __m512 scale_v = _mm512_set1_ps(d * (float)s0 * xs0);
+                scale_v = _mm512_insertf32x4(scale_v, _mm_set1_ps(d * (float)s1 * xs0), 1);
+                scale_v = _mm512_insertf32x4(scale_v, _mm_set1_ps(d * (float)s2 * xs1), 2);
+                scale_v = _mm512_insertf32x4(scale_v, _mm_set1_ps(d * (float)s3 * xs1), 3);
+                acc1 = _mm512_fmadd_ps(pf, scale_v, acc1);
+            }
+            /* --- half-chunk 2: c=1, hc=0 → acc2 --- */
+            {
+                const int c = 1, hc = 0;
+                __m256i ql_lo = _mm256_loadu_si256((const __m256i*)(ql + c*64 +  0));
+                __m256i ql_hi = _mm256_loadu_si256((const __m256i*)(ql + c*64 + 32));
+                __m256i ql_sub0 = _mm256_and_si256(ql_lo, mask_4);
+                __m256i ql_sub1 = _mm256_and_si256(ql_hi, mask_4);
+                __m256i qh_v = _mm256_loadu_si256((const __m256i*)(qh + c*32));
+                __m256i qh_sub0 = _mm256_and_si256(_mm256_srli_epi16(qh_v, 0), mask_2);
+                __m256i qh_sub1 = _mm256_and_si256(_mm256_srli_epi16(qh_v, 2), mask_2);
+                qh_sub0 = _mm256_slli_epi16(qh_sub0, 4);
+                qh_sub1 = _mm256_slli_epi16(qh_sub1, 4);
+                __m256i q_sub0 = _mm256_or_si256(ql_sub0, qh_sub0);
+                __m256i q_sub1 = _mm256_or_si256(ql_sub1, qh_sub1);
+                __m512i q_uint8_64 = _mm512_inserti64x4(
+                                        _mm512_castsi256_si512(q_sub0), q_sub1, 1);
+                __m512i x_int8_64 = _mm512_loadu_si512(&x_int_b[c*128 + hc*64]);
+                __m512i partials = _mm512_dpbusd_epi32(
+                                      _mm512_setzero_si512(), q_uint8_64, x_int8_64);
+                __m512 pf = _mm512_cvtepi32_ps(partials);
+                int s0 = scales[8*c + 4*hc + 0], s1 = scales[8*c + 4*hc + 1];
+                int s2 = scales[8*c + 4*hc + 2], s3 = scales[8*c + 4*hc + 3];
+                float xs0 = x_scale_b[4*c + 2*hc + 0];
+                float xs1 = x_scale_b[4*c + 2*hc + 1];
+                __m512 scale_v = _mm512_set1_ps(d * (float)s0 * xs0);
+                scale_v = _mm512_insertf32x4(scale_v, _mm_set1_ps(d * (float)s1 * xs0), 1);
+                scale_v = _mm512_insertf32x4(scale_v, _mm_set1_ps(d * (float)s2 * xs1), 2);
+                scale_v = _mm512_insertf32x4(scale_v, _mm_set1_ps(d * (float)s3 * xs1), 3);
+                acc2 = _mm512_fmadd_ps(pf, scale_v, acc2);
+            }
+            /* --- half-chunk 3: c=1, hc=1 → acc3 --- */
+            {
+                const int c = 1, hc = 1;
+                __m256i ql_lo = _mm256_loadu_si256((const __m256i*)(ql + c*64 +  0));
+                __m256i ql_hi = _mm256_loadu_si256((const __m256i*)(ql + c*64 + 32));
+                __m256i ql_sub0 = _mm256_and_si256(_mm256_srli_epi16(ql_lo, 4), mask_4);
+                __m256i ql_sub1 = _mm256_and_si256(_mm256_srli_epi16(ql_hi, 4), mask_4);
+                __m256i qh_v = _mm256_loadu_si256((const __m256i*)(qh + c*32));
+                __m256i qh_sub0 = _mm256_and_si256(_mm256_srli_epi16(qh_v, 4), mask_2);
+                __m256i qh_sub1 = _mm256_and_si256(_mm256_srli_epi16(qh_v, 6), mask_2);
+                qh_sub0 = _mm256_slli_epi16(qh_sub0, 4);
+                qh_sub1 = _mm256_slli_epi16(qh_sub1, 4);
+                __m256i q_sub0 = _mm256_or_si256(ql_sub0, qh_sub0);
+                __m256i q_sub1 = _mm256_or_si256(ql_sub1, qh_sub1);
+                __m512i q_uint8_64 = _mm512_inserti64x4(
+                                        _mm512_castsi256_si512(q_sub0), q_sub1, 1);
+                __m512i x_int8_64 = _mm512_loadu_si512(&x_int_b[c*128 + hc*64]);
+                __m512i partials = _mm512_dpbusd_epi32(
+                                      _mm512_setzero_si512(), q_uint8_64, x_int8_64);
+                __m512 pf = _mm512_cvtepi32_ps(partials);
+                int s0 = scales[8*c + 4*hc + 0], s1 = scales[8*c + 4*hc + 1];
+                int s2 = scales[8*c + 4*hc + 2], s3 = scales[8*c + 4*hc + 3];
+                float xs0 = x_scale_b[4*c + 2*hc + 0];
+                float xs1 = x_scale_b[4*c + 2*hc + 1];
+                __m512 scale_v = _mm512_set1_ps(d * (float)s0 * xs0);
+                scale_v = _mm512_insertf32x4(scale_v, _mm_set1_ps(d * (float)s1 * xs0), 1);
+                scale_v = _mm512_insertf32x4(scale_v, _mm_set1_ps(d * (float)s2 * xs1), 2);
+                scale_v = _mm512_insertf32x4(scale_v, _mm_set1_ps(d * (float)s3 * xs1), 3);
+                acc3 = _mm512_fmadd_ps(pf, scale_v, acc3);
+            }
+        }
+        __m512 acc01 = _mm512_add_ps(acc0, acc1);
+        __m512 acc23 = _mm512_add_ps(acc2, acc3);
+        __m512 acc_v = _mm512_add_ps(acc01, acc23);
+        y[o] = _mm512_reduce_add_ps(acc_v) + acc_correction;
+    }
+
+    free(x_int);
+    free(x_scale);
+    free(sum_x16);
+}
+#endif /* __AVX512VNNI__ */
+
 /* ----- Q6_K: 210 bytes / 256 elements ------------------------------ */
 /* Block layout (matches ggml-common.h block_q6_K):
  *   ql[128]   : offset 0,  low 4 bits per element (NON-INTERLEAVED)
@@ -744,6 +1020,113 @@ void pickle_fast_matmul_q6_k(float* y,
     const int BS = 256;
     const size_t block_bytes = 210;
     int n_blocks = in_n / BS;
+#if defined(__AVX512VNNI__)
+    /* Best path: VNNI dot product (uint8×int8→int32 MAC, 64-wide) with
+     * Approach A (unsigned q accumulation + separate -32 correction). */
+    pickle_fast_matmul_q6_k_vnni(y, W, out_n, in_n, x);
+    (void)n_blocks;
+#elif defined(__AVX512F__)
+    /* ===== Hand-vectorised AVX-512 F (16-wide float) Q6_K vec_dot =====
+     * Same quant extraction as the VNNI path, but instead of dpbusd we
+     * zero-extend each 16-byte quarter to int32 → float, subtract 32, apply
+     * the per-sub-block scale `d*scales[s]`, and FMA against the float x.
+     * Uses float x directly (no Q8_0 pre-quant), so it matches the scalar
+     * path to within FP rounding — safest fallback. Four independent
+     * accumulators (acc0..acc3) break the FMA dependency chain. */
+    const __m256i mask_4 = _mm256_set1_epi8(0x0F);
+    const __m256i mask_2 = _mm256_set1_epi8(0x03);
+    const __m512 neg32 = _mm512_set1_ps(-32.0f);
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < out_n; o++) {
+        const unsigned char* row = W + (size_t)o * n_blocks * block_bytes;
+        __m512 acc0 = _mm512_setzero_ps();
+        __m512 acc1 = _mm512_setzero_ps();
+        __m512 acc2 = _mm512_setzero_ps();
+        __m512 acc3 = _mm512_setzero_ps();
+        for (int b = 0; b < n_blocks; b++) {
+            const unsigned char* blk = row + (size_t)b * block_bytes;
+            const unsigned char* ql     = blk;
+            const unsigned char* qh     = blk + 128;
+            const signed char*   scales = (const signed char*)(blk + 192);
+            float d = f16_bits_to_float((uint16_t)blk[208] | ((uint16_t)blk[209] << 8));
+            const float* xr = x + b * BS;
+
+            for (int c = 0; c < 2; c++) {
+                for (int hc = 0; hc < 2; hc++) {
+                    /* Same extraction as the VNNI kernel (see comments above). */
+                    __m256i ql_lo = _mm256_loadu_si256((const __m256i*)(ql + c*64 +  0));
+                    __m256i ql_hi = _mm256_loadu_si256((const __m256i*)(ql + c*64 + 32));
+                    __m256i ql_sub0, ql_sub1;
+                    if (hc == 0) {
+                        ql_sub0 = _mm256_and_si256(ql_lo, mask_4);
+                        ql_sub1 = _mm256_and_si256(ql_hi, mask_4);
+                    } else {
+                        ql_sub0 = _mm256_and_si256(_mm256_srli_epi16(ql_lo, 4), mask_4);
+                        ql_sub1 = _mm256_and_si256(_mm256_srli_epi16(ql_hi, 4), mask_4);
+                    }
+                    __m256i qh_v = _mm256_loadu_si256((const __m256i*)(qh + c*32));
+                    int shift0 = 4 * hc;
+                    int shift1 = 4 * hc + 2;
+                    __m256i qh_sub0 = _mm256_and_si256(_mm256_srli_epi16(qh_v, shift0), mask_2);
+                    __m256i qh_sub1 = _mm256_and_si256(_mm256_srli_epi16(qh_v, shift1), mask_2);
+                    qh_sub0 = _mm256_slli_epi16(qh_sub0, 4);
+                    qh_sub1 = _mm256_slli_epi16(qh_sub1, 4);
+                    __m256i q_sub0 = _mm256_or_si256(ql_sub0, qh_sub0);
+                    __m256i q_sub1 = _mm256_or_si256(ql_sub1, qh_sub1);
+
+                    /* Zero-extend 16 uint8 → 16 int32 (4 zmm registers). */
+                    __m512i q0_i32 = _mm512_cvtepu8_epi32(_mm256_castsi256_si128(q_sub0));
+                    __m512i q1_i32 = _mm512_cvtepu8_epi32(_mm256_extracti128_si256(q_sub0, 1));
+                    __m512i q2_i32 = _mm512_cvtepu8_epi32(_mm256_castsi256_si128(q_sub1));
+                    __m512i q3_i32 = _mm512_cvtepu8_epi32(_mm256_extracti128_si256(q_sub1, 1));
+
+                    /* Convert to float. */
+                    __m512 q0_f = _mm512_cvtepi32_ps(q0_i32);
+                    __m512 q1_f = _mm512_cvtepi32_ps(q1_i32);
+                    __m512 q2_f = _mm512_cvtepi32_ps(q2_i32);
+                    __m512 q3_f = _mm512_cvtepi32_ps(q3_i32);
+
+                    /* Per-sub-block-of-16 scale: d * scales[8c + 4hc + sub]. */
+                    float d0 = d * (float)scales[8*c + 4*hc + 0];
+                    float d1 = d * (float)scales[8*c + 4*hc + 1];
+                    float d2 = d * (float)scales[8*c + 4*hc + 2];
+                    float d3 = d * (float)scales[8*c + 4*hc + 3];
+                    __m512 ds0 = _mm512_set1_ps(d0);
+                    __m512 ds1 = _mm512_set1_ps(d1);
+                    __m512 ds2 = _mm512_set1_ps(d2);
+                    __m512 ds3 = _mm512_set1_ps(d3);
+
+                    /* dq = d_scale * (q - 32) = q * d_scale + (-32 * d_scale)
+                     * computed as a single FMA: q * d_scale + (neg32 * d_scale). */
+                    __m512 dq0 = _mm512_fmadd_ps(q0_f, ds0, _mm512_mul_ps(neg32, ds0));
+                    __m512 dq1 = _mm512_fmadd_ps(q1_f, ds1, _mm512_mul_ps(neg32, ds1));
+                    __m512 dq2 = _mm512_fmadd_ps(q2_f, ds2, _mm512_mul_ps(neg32, ds2));
+                    __m512 dq3 = _mm512_fmadd_ps(q3_f, ds3, _mm512_mul_ps(neg32, ds3));
+
+                    /* Load 64 floats of x and FMA into 4 independent accumulators. */
+                    int xo = c*128 + hc*64;
+                    __m512 x0 = _mm512_loadu_ps(&xr[xo +  0]);
+                    __m512 x1 = _mm512_loadu_ps(&xr[xo + 16]);
+                    __m512 x2 = _mm512_loadu_ps(&xr[xo + 32]);
+                    __m512 x3 = _mm512_loadu_ps(&xr[xo + 48]);
+                    acc0 = _mm512_fmadd_ps(dq0, x0, acc0);
+                    acc1 = _mm512_fmadd_ps(dq1, x1, acc1);
+                    acc2 = _mm512_fmadd_ps(dq2, x2, acc2);
+                    acc3 = _mm512_fmadd_ps(dq3, x3, acc3);
+                }
+            }
+        }
+        __m512 acc01 = _mm512_add_ps(acc0, acc1);
+        __m512 acc23 = _mm512_add_ps(acc2, acc3);
+        __m512 acc_v = _mm512_add_ps(acc01, acc23);
+        y[o] = _mm512_reduce_add_ps(acc_v);
+    }
+#else
+    /* ===== Scalar fallback (auto-vectorised ymm/zmm by the compiler) ===== */
+    /* Fused dequant+dot: instead of staging 256 floats to a stack
+     * buffer and then dot-producting, we accumulate straight into acc
+     * as each element is dequanted. Saves 1KB of stack traffic per
+     * block and keeps partials in registers across the dot. */
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < out_n; o++) {
         const unsigned char* row = W + (size_t)o * n_blocks * block_bytes;
@@ -800,6 +1183,7 @@ void pickle_fast_matmul_q6_k(float* y,
         }
         y[o] = acc;
     }
+#endif /* __AVX512VNNI__ / __AVX512F__ / scalar */
 }
 
 /* ----- Q8_K: 292 bytes / 256 elements ------------------------------ */
