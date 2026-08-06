@@ -55,6 +55,7 @@
 int  pickle_load_from_file      (const char* path, pickle_model_t** out_model);
 int  pickle_load_from_file_meta (const char* path, pickle_model_t** out_model);
 int  pickle_load_from_file_lazy (const char* path, pickle_model_t** out_model);
+int  pickle_load_from_file_mmap (const char* path, pickle_model_t** out_model);
 int  pickle_run_prompt(pickle_model_t* model, const pickle_arch_t* arch,
                        const char* prompt_str, size_t n_gen,
                        int32_t* out_buf, size_t out_buf_size, size_t* out_n);
@@ -296,7 +297,7 @@ static int stream_token(int32_t id, void* user_ctx) {
 
 static int cmd_infer(const char* path, const char* prompt, cli_opts_t* opts) {
     pickle_model_t* m = 0;
-    int rc = pickle_load_from_file_lazy(path, &m);
+    int rc = pickle_load_from_file_mmap(path, &m);
     if (rc != PICKLE_OK) return 1;
 
     pickle_arch_t a;
@@ -333,7 +334,7 @@ static int cmd_infer(const char* path, const char* prompt, cli_opts_t* opts) {
 
 static int cmd_bench(const char* path, const char* prompt, cli_opts_t* opts) {
     pickle_model_t* m = 0;
-    int rc = pickle_load_from_file_lazy(path, &m);
+    int rc = pickle_load_from_file_mmap(path, &m);
     if (rc != PICKLE_OK) return 1;
 
     pickle_arch_t a;
@@ -384,7 +385,7 @@ static int cmd_bench(const char* path, const char* prompt, cli_opts_t* opts) {
 
 static int cmd_chat(const char* path, cli_opts_t* opts) {
     pickle_model_t* m = 0;
-    int rc = pickle_load_from_file_lazy(path, &m);
+    int rc = pickle_load_from_file_mmap(path, &m);
     if (rc != PICKLE_OK) return 1;
 
     pickle_arch_t a;

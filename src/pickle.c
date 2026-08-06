@@ -40,6 +40,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>   /* munmap for mmap-backed models */
 #define pr_info   printf
 #define kmalloc   malloc
 #define kfree     free
@@ -214,6 +215,14 @@ struct pickle_model {
      * pickle_load(), io remains NULL (all tensors already dequantized). */
     pickle_io_t*   io;
     int64_t        data_section_start;
+#ifndef PICKLE_KERNEL
+    /* mmap backend (host only): when non-NULL, every tensor's data pointer
+     * points into this mmap region and must NOT be individually freed.
+     * pickle_free() will munmap() the whole region instead of calling
+     * pfree() on each tensor. Set by pickle_attach_mmap(). */
+    void*  mmap_base;
+    size_t mmap_size;
+#endif
 };
 
 /* ================================================================== */
@@ -366,9 +375,10 @@ int pickle_load_meta(pickle_io_t* io, pickle_model_t** out_model) {
  * F32 data is stored in t->data (allocated here). If already dequantized,
  * this is a no-op. */
 int pickle_dequant_tensor(pickle_model_t* m, size_t idx) {
-    if (!m || !m->io || idx >= m->tensor_count) return PICKLE_ERR_ARG;
+    if (!m || idx >= m->tensor_count) return PICKLE_ERR_ARG;
     pickle_tensor_info_t* t = &m->tensors[idx];
-    if (t->data) return PICKLE_OK;  /* already dequantized */
+    if (t->data) return PICKLE_OK;  /* already loaded (mmap, raw, or dequant) */
+    if (!m->io) return PICKLE_ERR_ARG;  /* no io to read from */
 
     m->io->seek(m->io->ctx, m->data_section_start + (int64_t)t->data_offset, PICKLE_SEEK_SET);
     size_t bytes = (size_t)t->n_elements * sizeof(sfp_t);
@@ -396,9 +406,10 @@ int pickle_dequant_tensor(pickle_model_t* m, size_t idx) {
  * No-op if t->data is already non-NULL (whether from a previous raw
  * load or a full dequant). */
 int pickle_load_tensor_raw(pickle_model_t* m, size_t idx) {
-    if (!m || !m->io || idx >= m->tensor_count) return PICKLE_ERR_ARG;
+    if (!m || idx >= m->tensor_count) return PICKLE_ERR_ARG;
     pickle_tensor_info_t* t = &m->tensors[idx];
-    if (t->data) return PICKLE_OK;  /* already loaded */
+    if (t->data) return PICKLE_OK;  /* already loaded (mmap, raw, or dequant) */
+    if (!m->io) return PICKLE_ERR_ARG;  /* no io to read from */
 
     m->io->seek(m->io->ctx, m->data_section_start + (int64_t)t->data_offset, PICKLE_SEEK_SET);
     size_t bytes = t->data_size;
@@ -413,6 +424,38 @@ int pickle_load_tensor_raw(pickle_model_t* m, size_t idx) {
     }
     return PICKLE_OK;
 }
+
+#ifndef PICKLE_KERNEL
+/* Attach an mmap'd file region to a meta-loaded model. Patches every
+ * tensor's data pointer to point directly into the mmap at the correct
+ * offset (zero-copy: no malloc, no fread). Stores the mmap base/size so
+ * pickle_free() can munmap() the region.
+ *
+ * After this call the model no longer needs its io (pickle_free won't
+ * touch it — the caller is responsible for closing/freeing the io).
+ *
+ * This is the preferred load path for host inference: instant startup
+ * (no multi-second fread of 600+ MB), zero copy, and the OS page cache
+ * manages demand paging. Use pickle_load_from_file_mmap() in the host
+ * shim which does the mmap + meta parse + attach in one call. */
+int pickle_attach_mmap(pickle_model_t* m, void* mmap_base, size_t mmap_size) {
+    if (!m || !mmap_base || mmap_size == 0) return PICKLE_ERR_ARG;
+    m->mmap_base = mmap_base;
+    m->mmap_size = mmap_size;
+    /* Patch every tensor's data pointer into the mmap. The data_offset
+     * field (set by pickle_load_meta) is the byte offset of the tensor's
+     * data within the GGUF data section; data_section_start is where the
+     * data section begins in the file. */
+    unsigned char* base = (unsigned char*)mmap_base;
+    for (uint64_t i = 0; i < m->tensor_count; i++) {
+        pickle_tensor_info_t* t = &m->tensors[i];
+        t->data = base + m->data_section_start + (size_t)t->data_offset;
+    }
+    /* Detach the io — the caller owns it and will close/free it. */
+    m->io = NULL;
+    return PICKLE_OK;
+}
+#endif
 
 int pickle_load(pickle_io_t* io, pickle_model_t** out_model) {
     int rc = pickle_load_meta(io, out_model);
@@ -444,10 +487,24 @@ int pickle_load(pickle_io_t* io, pickle_model_t** out_model) {
 
 void pickle_free(pickle_model_t* m) {
     if (!m) return;
+#ifndef PICKLE_KERNEL
+    if (m->mmap_base) {
+        /* mmap'd model: all tensor data pointers point into the mmap.
+         * Don't pfree them individually — just munmap the whole region. */
+        munmap(m->mmap_base, m->mmap_size);
+        m->mmap_base = NULL;
+    } else {
+        for (uint64_t i = 0; i < m->tensor_count; i++) {
+            if (m->tensors[i].data) pfree(m->tensors[i].data,
+                                          (size_t)m->tensors[i].n_elements * sizeof(sfp_t));
+        }
+    }
+#else
     for (uint64_t i = 0; i < m->tensor_count; i++) {
         if (m->tensors[i].data) pfree(m->tensors[i].data,
                                       (size_t)m->tensors[i].n_elements * sizeof(sfp_t));
     }
+#endif
     pfree(m->tensors, (size_t)m->tensor_count * sizeof(pickle_tensor_info_t));
     for (uint64_t i = 0; i < m->kv_count; i++) {
         if (m->kv[i].key) pfree(m->kv[i].key, strlen(m->kv[i].key) + 1);

@@ -90,6 +90,26 @@ typedef struct {
 
     /* float view of every dequantized tensor (point into model's
      * tensor data buffer which already stores IEEE-754 f32). */
+
+    /* ---- Pre-allocated working buffers for the forward pass ---- */
+    /* Allocated once in pickle_fast_state_init() and reused across every
+     * forward call. Eliminates ~13 malloc/free pairs per token in the
+     * decode loop — the #1 source of allocator overhead. Each buffer is
+     * sized for the model's dimensions and never grows. */
+    float* x;        /* [hidden_dim]              — current hidden state */
+    float* xn;       /* [hidden_dim]              — normed input for q/k/v */
+    float* q;        /* [n_heads * head_dim]      — query projection */
+    float* k;        /* [n_kv_heads * head_dim]   — key projection */
+    float* v;        /* [n_kv_heads * head_dim]   — value projection */
+    float* ao;       /* [n_heads * head_dim]      — attention output */
+    float* aproj;    /* [hidden_dim]              — attention output projection */
+    float* xn2;      /* [hidden_dim]              — normed input for gate/up */
+    float* gate;     /* [intermediate_dim]        — FFN gate projection */
+    float* up;       /* [intermediate_dim]        — FFN up projection */
+    float* act;      /* [intermediate_dim]        — SwiGLU activation */
+    float* down;     /* [hidden_dim]              — FFN down projection */
+    float* scores;   /* [max_seq]                 — attention score scratch */
+    float* emb_row;  /* [hidden_dim]              — per-row F16 embd dequant */
 } pickle_fast_state_t;
 
 /* Build the fast-state from a loaded model + detected arch. Returns

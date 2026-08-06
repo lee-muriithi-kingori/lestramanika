@@ -159,6 +159,15 @@ int  pickle_dequant_tensor(pickle_model_t* m, size_t idx);
  * already loaded (raw or dequantized). */
 int  pickle_load_tensor_raw(pickle_model_t* m, size_t idx);
 
+#ifndef PICKLE_KERNEL
+/* Attach an mmap'd file region to a meta-loaded model. Patches every
+ * tensor's data pointer to point directly into the mmap (zero-copy).
+ * pickle_free() will munmap() the region. After this call the model's
+ * io is detached (caller owns it). This is the preferred host load
+ * path — instant startup, zero copy, OS demand-paging. */
+int  pickle_attach_mmap(pickle_model_t* m, void* mmap_base, size_t mmap_size);
+#endif
+
 /* Release a model and all its tensors. */
 void pickle_free(pickle_model_t* model);
 
