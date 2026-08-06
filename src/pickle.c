@@ -205,6 +205,12 @@ struct pickle_model {
     pickle_kv_t*   kv;
     pickle_tensor_info_t* tensors;
     uint32_t       alignment;
+    /* On-demand dequant support: when loaded via pickle_load_meta(),
+     * io and data_section_start are stored so individual tensors can
+     * be dequantized later via pickle_dequant_tensor(). For full
+     * pickle_load(), io remains NULL (all tensors already dequantized). */
+    pickle_io_t*   io;
+    int64_t        data_section_start;
 };
 
 /* ================================================================== */
@@ -260,7 +266,15 @@ static int parse_metadata_value(pickle_io_t* io, uint32_t type, pickle_kv_t* kv)
     }
 }
 
-int pickle_load(pickle_io_t* io, pickle_model_t** out_model) {
+/* Parse GGUF header + metadata + tensor table. Does NOT read or
+ * dequantize tensor data. Stores io + data_section_start in the model
+ * for later use by pickle_dequant_tensor().
+ *
+ * This is the fast path for `pickle info` and `pickle dequant <tensor>`
+ * — loading only metadata from a 638MB Q4_K_M model takes milliseconds
+ * instead of hours (full dequant of every tensor with the software-float
+ * layer is O(billions of F32 ops)). */
+int pickle_load_meta(pickle_io_t* io, pickle_model_t** out_model) {
     if (!io || !out_model) return PICKLE_ERR_ARG;
     if (!g_alloc.alloc) pickle_set_alloc(0);
 
@@ -269,6 +283,8 @@ int pickle_load(pickle_io_t* io, pickle_model_t** out_model) {
 
     pickle_model_t* m = (pickle_model_t*)palloc(sizeof(pickle_model_t));
     if (!m) return PICKLE_ERR_MEMORY;
+    m->io = NULL;
+    m->data_section_start = 0;
     m->version = read_u32(io);
     if (m->version != 3 && m->version != 2) {
         pfree(m, sizeof(*m));
@@ -332,22 +348,65 @@ int pickle_load(pickle_io_t* io, pickle_model_t** out_model) {
         }
     }
 
+    /* Store io + data_section_start for on-demand dequant. The caller
+     * must keep the io (and its underlying FILE*) alive until
+     * pickle_free() is called. */
+    m->io = io;
+    m->data_section_start = data_section_start;
+
+    *out_model = m;
+    return PICKLE_OK;
+}
+
+/* Dequantize a single tensor on demand. The model must have been loaded
+ * via pickle_load_meta() (which stores the io). The tensor's dequantized
+ * F32 data is stored in t->data (allocated here). If already dequantized,
+ * this is a no-op. */
+int pickle_dequant_tensor(pickle_model_t* m, size_t idx) {
+    if (!m || !m->io || idx >= m->tensor_count) return PICKLE_ERR_ARG;
+    pickle_tensor_info_t* t = &m->tensors[idx];
+    if (t->data) return PICKLE_OK;  /* already dequantized */
+
+    m->io->seek(m->io->ctx, m->data_section_start + (int64_t)t->data_offset, PICKLE_SEEK_SET);
+    size_t bytes = (size_t)t->n_elements * sizeof(sfp_t);
+    bytes = (bytes + 15u) & ~15u;
+    t->data = palloc(bytes);
+    if (!t->data) return PICKLE_ERR_MEMORY;
+    int rc = pickle_dequant_stream(m->io, t->type, t->n_elements, (float*)t->data);
+    if (rc != PICKLE_OK) {
+        pr_info("pickle: dequant failed for tensor %s (type %u): rc=%d\n",
+                t->name, t->type, rc);
+        pfree(t->data, bytes);
+        t->data = 0;
+    }
+    return rc;
+}
+
+int pickle_load(pickle_io_t* io, pickle_model_t** out_model) {
+    int rc = pickle_load_meta(io, out_model);
+    if (rc != PICKLE_OK) return rc;
+    pickle_model_t* m = *out_model;
+
+    /* Full load: dequantize all tensors now. io is NOT retained (caller
+     * can close it after this returns). */
+    pickle_io_t* saved_io = m->io;
+    m->io = NULL;  /* detach so pickle_free won't touch it */
+
     for (uint64_t i = 0; i < m->tensor_count; i++) {
         pickle_tensor_info_t* t = &m->tensors[i];
-        io->seek(io->ctx, data_section_start + (int64_t)t->data_offset, PICKLE_SEEK_SET);
+        saved_io->seek(saved_io->ctx, m->data_section_start + (int64_t)t->data_offset, PICKLE_SEEK_SET);
         size_t bytes = (size_t)t->n_elements * sizeof(sfp_t);
         bytes = (bytes + 15u) & ~15u;
         t->data = palloc(bytes);
         if (!t->data) return PICKLE_ERR_MEMORY;
-        int rc = pickle_dequant_stream(io, t->type, t->n_elements, (float*)t->data);
-        if (rc != PICKLE_OK) {
+        int drc = pickle_dequant_stream(saved_io, t->type, t->n_elements, (float*)t->data);
+        if (drc != PICKLE_OK) {
             pr_info("pickle: dequant failed for tensor %s (type %u): rc=%d\n",
-                    t->name, t->type, rc);
-            return rc;
+                    t->name, t->type, drc);
+            return drc;
         }
     }
 
-    *out_model = m;
     return PICKLE_OK;
 }
 
@@ -364,6 +423,17 @@ void pickle_free(pickle_model_t* m) {
             pfree(m->kv[i].v.str, strlen(m->kv[i].v.str) + 1);
     }
     pfree(m->kv, (size_t)m->kv_count * sizeof(pickle_kv_t));
+    /* If the model owns an io (from pickle_load_meta), close + free it. */
+    if (m->io) {
+        if (m->io->close) m->io->close(m->io->ctx);
+        /* The io struct itself was heap-allocated by the host shim
+         * (pickle_load_from_file_meta). Free it with the C library free()
+         * since it was allocated with calloc, not the pickle allocator. */
+#ifndef PICKLE_KERNEL
+        free(m->io);
+#endif
+        m->io = NULL;
+    }
     pfree(m, sizeof(*m));
 }
 

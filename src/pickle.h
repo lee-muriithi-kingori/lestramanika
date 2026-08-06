@@ -112,6 +112,7 @@ typedef struct pickle_io {
     size_t (*read)(void* ctx, void* buf, size_t len);
     int    (*seek)(void* ctx, int64_t offset, int whence);
     int64_t (*tell)(void* ctx);
+    void   (*close)(void* ctx);  /* optional: called by pickle_free if io is owned */
 } pickle_io_t;
 
 /* ------------------------------------------------------------------ */
@@ -135,6 +136,20 @@ typedef struct pickle_model pickle_model_t;
 /* Parse a GGUF stream and load all tensors into RAM. On success
  * *out_model is a new handle (free with pickle_free). */
 int  pickle_load(pickle_io_t* io, pickle_model_t** out_model);
+
+/* Parse GGUF header + metadata + tensor table ONLY — does NOT read or
+ * dequantize tensor data. The io is retained in the model for on-demand
+ * dequantization via pickle_dequant_tensor(). The caller must keep the
+ * io (and its underlying file) alive until pickle_free().
+ *
+ * Use this for `info` and `dequant <tensor>` commands — loading metadata
+ * from a large model is instant vs hours for full dequant. */
+int  pickle_load_meta(pickle_io_t* io, pickle_model_t** out_model);
+
+/* Dequantize a single tensor on demand. Model must be loaded via
+ * pickle_load_meta(). Stores the F32 result in tensors[idx].data.
+ * No-op if already dequantized. */
+int  pickle_dequant_tensor(pickle_model_t* m, size_t idx);
 
 /* Release a model and all its tensors. */
 void pickle_free(pickle_model_t* model);

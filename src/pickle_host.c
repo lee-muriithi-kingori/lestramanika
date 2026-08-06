@@ -112,6 +112,47 @@ int pickle_load_from_file(const char* path, pickle_model_t** out_model) {
     return PICKLE_OK;
 }
 
+/* Metadata-only load: parses header + KV + tensor table but does NOT
+ * dequantize tensor data. The FILE* is kept open (stored in the model's
+ * io) so individual tensors can be dequantized on demand via
+ * pickle_dequant_tensor(). The caller must still call pickle_free()
+ * (which will close the file via the io — see pickle_host_close).
+ *
+ * Use this for `info` and `dequant <tensor>` — instant vs hours. */
+static void host_io_close(void* ctx) {
+    FILE* f = (FILE*)ctx;
+    if (f) fclose(f);
+}
+
+int pickle_load_from_file_meta(const char* path, pickle_model_t** out_model) {
+    if (!path || !out_model) return PICKLE_ERR_ARG;
+    *out_model = 0;
+
+    pickle_alloc_init_host();
+
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "pickle: failed to open '%s'\n", path);
+        return PICKLE_ERR_IO;
+    }
+
+    /* Allocate a persistent io struct (not stack) so it outlives this
+     * function call. pickle_free() will close the file and free the io. */
+    pickle_io_t* io = (pickle_io_t*)calloc(1, sizeof(pickle_io_t));
+    if (!io) { fclose(f); return PICKLE_ERR_MEMORY; }
+    pickle_io_init_file(io, f);
+    io->close = host_io_close;  /* pickle_free will call this */
+
+    int rc = pickle_load_meta(io, out_model);
+    if (rc != PICKLE_OK) {
+        fprintf(stderr, "pickle: failed to load meta '%s': rc=%d\n", path, rc);
+        fclose(f);
+        free(io);
+        return rc;
+    }
+    return PICKLE_OK;
+}
+
 /* ================================================================== */
 /* pickle_run_prompt                                                  */
 /* ================================================================== */

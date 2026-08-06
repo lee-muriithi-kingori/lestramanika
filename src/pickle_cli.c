@@ -35,9 +35,12 @@
 
 /* Forward declarations from pickle_host.c */
 int  pickle_load_from_file(const char* path, pickle_model_t** out_model);
+int  pickle_load_from_file_meta(const char* path, pickle_model_t** out_model);
 int  pickle_run_prompt(pickle_model_t* model, const pickle_arch_t* arch,
                        const char* prompt_str, size_t n_gen,
                        int32_t* out_buf, size_t out_buf_size, size_t* out_n);
+/* From pickle.c — on-demand single-tensor dequant (needs meta-only load). */
+int  pickle_dequant_tensor(pickle_model_t* m, size_t idx);
 
 /* ---- helpers ------------------------------------------------------- */
 static const char* dtype_name(uint32_t t) {
@@ -85,7 +88,8 @@ static int cmd_selftest(void) {
 
 static int cmd_info(const char* path) {
     pickle_model_t* m = 0;
-    int rc = pickle_load_from_file(path, &m);
+    /* Metadata-only load: instant even for multi-GB models (no dequant). */
+    int rc = pickle_load_from_file_meta(path, &m);
     if (rc != PICKLE_OK) return 1;
 
     pickle_arch_t a;
@@ -193,13 +197,24 @@ static int cmd_infer(const char* path, const char* prompt, long n_gen_in) {
 
 static int cmd_dequant(const char* path, const char* tensor_name) {
     pickle_model_t* m = 0;
-    int rc = pickle_load_from_file(path, &m);
+    /* Metadata-only load, then dequantize JUST the requested tensor.
+     * This makes `pickle dequant` usable on multi-GB models (dequantizing
+     * ALL tensors with the software-float layer would take hours). */
+    int rc = pickle_load_from_file_meta(path, &m);
     if (rc != PICKLE_OK) return 1;
 
     int ti = pickle_tensor_find(m, tensor_name);
     if (ti < 0) {
         fprintf(stderr, "pickle: tensor '%s' not found in '%s'\n",
                 tensor_name, path);
+        pickle_free(m);
+        return 1;
+    }
+
+    /* On-demand dequant of just this one tensor. */
+    rc = pickle_dequant_tensor(m, (size_t)ti);
+    if (rc != PICKLE_OK) {
+        fprintf(stderr, "pickle: dequant_tensor failed: rc=%d\n", rc);
         pickle_free(m);
         return 1;
     }
