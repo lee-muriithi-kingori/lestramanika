@@ -151,6 +151,14 @@ int  pickle_load_meta(pickle_io_t* io, pickle_model_t** out_model);
  * No-op if already dequantized. */
 int  pickle_dequant_tensor(pickle_model_t* m, size_t idx);
 
+/* Load a single tensor's raw on-disk bytes into tensors[idx].data
+ * WITHOUT dequantizing. Used by the fast-path inference engine so
+ * the quantized matmul kernels can read the raw Q4_K/Q6_K/... block
+ * bytes directly (dequantizing block-by-block inside the dot product).
+ * For F32/F16 tensors the raw bytes ARE the native format. No-op if
+ * already loaded (raw or dequantized). */
+int  pickle_load_tensor_raw(pickle_model_t* m, size_t idx);
+
 /* Release a model and all its tensors. */
 void pickle_free(pickle_model_t* model);
 

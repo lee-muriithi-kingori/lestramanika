@@ -11,18 +11,30 @@
  *   - pickle_alloc_t wrapping malloc / free
  *   - pickle_load_from_file(path, &model)  — opens the file, wires up the
  *     io + alloc, and calls pickle_load
+ *   - pickle_load_from_file_lazy(path, &model) — metadata-only load via
+ *     pickle_load_meta(); the FILE* is kept open for on-demand dequant.
+ *     Used by `chat` / `bench` so we don't pay the full-dequant cost up
+ *     front — fast matmul dequants each block on the fly inside the
+ *     dot product.
  *   - pickle_run_prompt(model, arch, prompt_str, n_gen, out_buf, buf_size)
  *     — runs the Llama forward pass on a character-level-tokenized prompt,
  *     then greedily generates n_gen tokens and returns them in out_buf
+ *     (legacy soft-float path; kept for the demo model)
+ *   - pickle_chat_loop(...) — fast-path streaming generation loop with
+ *     BPE tokenizer, contiguous KV cache, optional temperature/top_p
+ *     sampling, and a per-token callback for streaming output.
  *
  * This file is host-only: it uses <stdio.h>, <stdlib.h>, <string.h> and is
  * NOT compiled for the lestraOS kernel.
  */
 #include "pickle.h"
+#include "pickle_fast.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <time.h>
 
 /* ================================================================== */
 /* FILE*-based pickle_io_t                                            */
@@ -248,4 +260,156 @@ int pickle_run_prompt(
     pickle_kv_free(&kv);
     free(prompt_tokens);
     return PICKLE_OK;
+}
+
+/* ================================================================== */
+/* Lazy (metadata-only) load — for chat / bench                       */
+/* ================================================================== */
+/* Same as pickle_load_from_file_meta() but kept open as the model's
+ * io so on-demand dequant works. Used by chat/bench/tokens so we
+ * don't materialise the full F32 weight matrix. */
+int pickle_load_from_file_lazy(const char* path, pickle_model_t** out_model) {
+    return pickle_load_from_file_meta(path, out_model);
+}
+
+/* ================================================================== */
+/* Fast chat loop — streaming generation with BPE tokenizer           */
+/* ================================================================== */
+/* Run the fast-path forward pass over a prompt (BPE-tokenised by the
+ * host tokenizer), then generate up to max_new_tokens, invoking the
+ * callback after each token. The callback may return non-zero to
+ * stop generation (e.g. on EOS or user interrupt).
+ *
+ * If temp <= 0, uses greedy argmax. Otherwise uses temperature +
+ * top_p (nucleus) sampling with the given seed.
+ *
+ * Stats: *out_prompt_n and *out_generated_n are filled with the
+ * prompt token count and the number of generated tokens (may be
+ * NULL). Returns PICKLE_OK on success.
+ */
+int pickle_chat_loop(
+    pickle_model_t*        model,
+    const pickle_arch_t*   arch,
+    pickle_tokenizer_t*    tok,
+    const char*            prompt,
+    int                    add_bos,
+    size_t                 max_new_tokens,
+    float                  temp,
+    float                  top_p,
+    uint32_t               seed,
+    /* callback: invoked with each generated token id; return non-zero
+     * to stop generation. user_ctx is passed through. */
+    int                    (*on_token)(int32_t id, void* user_ctx),
+    void*                  user_ctx,
+    size_t*                out_prompt_n,
+    size_t*                out_generated_n,
+    double*                out_prefill_ms,
+    double*                out_decode_avg_ms
+) {
+    if (!model || !arch || !tok || !prompt) return PICKLE_ERR_ARG;
+
+    int rc;
+    pickle_fast_state_t state;
+    rc = pickle_fast_state_init(model, arch, &state);
+    if (rc != PICKLE_OK) return rc;
+
+    pickle_fast_kv_t kv;
+    rc = pickle_fast_kv_alloc(arch, &kv);
+    if (rc != PICKLE_OK) { pickle_fast_state_free(&state); return rc; }
+
+    /* Tokenise prompt. */
+    int32_t* prompt_ids = NULL;
+    size_t   prompt_n = 0;
+    rc = pickle_tok_encode(tok, prompt, add_bos, &prompt_ids, &prompt_n);
+    if (rc != PICKLE_OK) {
+        pickle_fast_kv_free(&kv);
+        pickle_fast_state_free(&state);
+        return rc;
+    }
+    if (prompt_n == 0) {
+        free(prompt_ids);
+        pickle_fast_kv_free(&kv);
+        pickle_fast_state_free(&state);
+        return PICKLE_ERR_ARG;
+    }
+
+    /* The embedding tensor is dequantized inside pickle_fast_state_init
+     * (which has already been called above) if it was quantized. So by
+     * here, the cached state->tensors[embd].data is a valid F32 pointer. */
+
+    int VS = arch->vocab_size;
+    float* logits = (float*)calloc((size_t)VS, sizeof(float));
+    if (!logits) {
+        free(prompt_ids);
+        pickle_fast_kv_free(&kv);
+        pickle_fast_state_free(&state);
+        return PICKLE_ERR_MEMORY;
+    }
+
+    /* ---- Prefill: run the whole prompt through in one call. ---- */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    size_t kv_pos = 0;
+    rc = pickle_fast_forward(model, arch, &state,
+                             prompt_ids, prompt_n,
+                             logits, &kv, &kv_pos);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double prefill_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                        (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    if (rc != PICKLE_OK) {
+        free(logits); free(prompt_ids);
+        pickle_fast_kv_free(&kv);
+        pickle_fast_state_free(&state);
+        return rc;
+    }
+
+    /* ---- Decode loop ---- */
+    size_t generated = 0;
+    double decode_total_ms = 0.0;
+    int eos_id = pickle_tok_eos(tok);
+    int stop = 0;
+    for (size_t i = 0; i < max_new_tokens && !stop; i++) {
+        int32_t next;
+        if (temp <= 0.0f) {
+            next = pickle_fast_argmax(logits, (size_t)VS);
+        } else {
+            /* The sampler mutates logits (applies softmax in place).
+             * That's fine — we recompute logits on the next forward
+             * pass anyway. */
+            next = pickle_fast_sample_temp(logits, (size_t)VS, temp, top_p, seed + (uint32_t)i);
+        }
+        if (next < 0) next = 0;
+
+        if (on_token) {
+            if (on_token(next, user_ctx) != 0) { stop = 1; }
+        }
+        generated++;
+        if (next == eos_id) { stop = 1; }
+        if (stop) break;
+
+        if (kv_pos >= (size_t)arch->max_seq_len) break;
+
+        int32_t one = next;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        rc = pickle_fast_forward(model, arch, &state,
+                                 &one, 1,
+                                 logits, &kv, &kv_pos);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        decode_total_ms += (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                           (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        if (rc != PICKLE_OK) break;
+    }
+
+    free(logits);
+    free(prompt_ids);
+    pickle_fast_kv_free(&kv);
+    pickle_fast_state_free(&state);
+
+    if (out_prompt_n)      *out_prompt_n      = prompt_n;
+    if (out_generated_n)   *out_generated_n   = generated;
+    if (out_prefill_ms)    *out_prefill_ms    = prefill_ms;
+    if (out_decode_avg_ms) *out_decode_avg_ms = generated > 1
+        ? decode_total_ms / (double)(generated - 1)
+        : 0.0;
+    return rc;
 }

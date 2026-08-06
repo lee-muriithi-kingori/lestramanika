@@ -22,33 +22,48 @@
 #   make pickle_selftest   build only ./pickle_selftest
 #   make clean             remove binaries and *.o
 #   make test              build + run ./pickle_selftest and ./pickle selftest
+#   make bench             build + run a quick benchmark on the demo model
 
 CC      ?= cc
-CFLAGS  ?= -O2
+CFLAGS  ?= -O3
 CFLAGS  += -Wall -Wextra \
            -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function \
            -Wno-strict-aliasing -Wno-aggressive-loop-optimizations \
            -UPICKLE_KERNEL -Isrc
+# Enable native ISA so the compiler can auto-vectorise the fast-path
+# matmul/attention loops with SSE4.2 / AVX2 / FMA / F16C. Falls back
+# gracefully on older hosts (-march=native is widely supported).
+# Override with `make PICKLE_NO_NATIVE=1` to disable (e.g. for reproducible
+# cross-arch builds).
+ifneq ($(PICKLE_NO_NATIVE),1)
+	CFLAGS += -march=native -mfpmath=sse
+endif
 LDFLAGS ?=
 LDLIBS  ?= -lm
 
 # ---- object files --------------------------------------------------
 PICKLE_CORE_OBJS = \
-	src/pickle.o \
-	src/pickle_softfp.o \
-	src/pickle_demo_gguf.o
+        src/pickle.o \
+        src/pickle_softfp.o \
+        src/pickle_demo_gguf.o
+
+# Host-only fast path: native float math + quantized matmul + BPE tokenizer.
+PICKLE_FAST_OBJS = \
+        src/pickle_fast.o \
+        src/pickle_tokenizer.o
 
 CLI_OBJS = \
-	$(PICKLE_CORE_OBJS) \
-	src/pickle_host.o \
-	src/pickle_cli.o
+        $(PICKLE_CORE_OBJS) \
+        $(PICKLE_FAST_OBJS) \
+        src/pickle_host.o \
+        src/pickle_cli.o
 
 SELFTEST_OBJS = \
-	$(PICKLE_CORE_OBJS) \
-	src/pickle_selftest_main.o
+        $(PICKLE_CORE_OBJS) \
+        src/pickle_selftest_main.o
 
 # ---- top-level targets ---------------------------------------------
-.PHONY: all clean test pickle pickle_selftest
+.PHONY: all clean test pickle pickle_selftest bench
 
 all: pickle pickle_selftest
 
@@ -67,6 +82,11 @@ test: pickle_selftest pickle
 	@echo "--- ./pickle_selftest ---"
 	./pickle_selftest
 	@echo "--- ./pickle selftest ---"
+	./pickle selftest
+
+# ---- bench ---------------------------------------------------------
+bench: pickle
+	@echo "--- demo model bench ---"
 	./pickle selftest
 
 # ---- clean ---------------------------------------------------------
