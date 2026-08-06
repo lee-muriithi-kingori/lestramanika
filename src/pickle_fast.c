@@ -79,19 +79,25 @@ void pickle_fast_matmul_f32(float* y, const float* W, const float* x,
                             int out_n, int in_n) {
     /* Standard row-major matmul: y[o] = sum_i W[o*in_n + i] * x[i].
      * The compiler vectorises the inner loop; we additionally unroll
-     * by 4 to give it a clearer reduction chain. */
+     * by 4 to give it a clearer reduction chain. OpenMP parallelises
+     * across output rows — each thread owns disjoint o indices, so no
+     * synchronization is needed. */
+    #pragma omp parallel for schedule(static)
     for (int o = 0; o < out_n; o++) {
         const float* wrow = W + (size_t)o * in_n;
         float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
-        int i = 0;
         int n4 = in_n & ~3;
-        for (; i < n4; i += 4) {
+        /* 4-way unrolled reduction with independent accumulators —
+         * breaks the serial FMA dependency chain so the compiler can
+         * issue 4 parallel vfmadd231ps lanes (one per accumulator). */
+        #pragma omp simd simdlen(16) reduction(+:acc0,acc1,acc2,acc3)
+        for (int i = 0; i < n4; i += 4) {
             acc0 += wrow[i]     * x[i];
             acc1 += wrow[i + 1] * x[i + 1];
             acc2 += wrow[i + 2] * x[i + 2];
             acc3 += wrow[i + 3] * x[i + 3];
         }
-        for (; i < in_n; i++) acc0 += wrow[i] * x[i];
+        for (int i = n4; i < in_n; i++) acc0 += wrow[i] * x[i];
         y[o] = (acc0 + acc1) + (acc2 + acc3);
     }
 }
@@ -115,7 +121,10 @@ void pickle_fast_matmul_q4_0(float* y,
     const int BS = 32;
     const size_t block_bytes = 18;
     int n_blocks = in_n / BS;
-    float dq[32];
+    /* Fused dequant+dot: no intermediate dq[32] buffer — each element is
+     * dequanted straight into the accumulator. Halves memory traffic vs
+     * the two-pass form and lets the compiler keep partials in registers. */
+    #pragma omp parallel for schedule(static)
     for (int o = 0; o < out_n; o++) {
         const unsigned char* row = W + (size_t)o * n_blocks * block_bytes;
         float acc = 0.0f;
@@ -123,14 +132,18 @@ void pickle_fast_matmul_q4_0(float* y,
             const unsigned char* blk = row + (size_t)b * block_bytes;
             float d = f16_bits_to_float((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));
             const unsigned char* qs = blk + 2;
+            const float* xr = x + b * BS;
+            /* #pragma omp simd reduction forces vectorisation — without
+             * it the compiler emits scalar vmulss+vaddss, with it the
+             * int8->float conversion + FMA gets pipelined through
+             * ymm/zmm registers. */
+            #pragma omp simd simdlen(16) reduction(+:acc)
             for (int i = 0; i < 16; i++) {
                 int lo = qs[i] & 0x0F;
                 int hi = (qs[i] >> 4) & 0x0F;
-                dq[i]      = d * (float)(lo - 8);
-                dq[16 + i] = d * (float)(hi - 8);
+                acc += d * (float)(lo - 8) * xr[i];
+                acc += d * (float)(hi - 8) * xr[16 + i];
             }
-            const float* xr = x + b * BS;
-            for (int i = 0; i < BS; i++) acc += dq[i] * xr[i];
         }
         y[o] = acc;
     }
@@ -145,7 +158,7 @@ void pickle_fast_matmul_q4_1(float* y,
     const int BS = 32;
     const size_t block_bytes = 20;
     int n_blocks = in_n / BS;
-    float dq[32];
+    #pragma omp parallel for schedule(static)
     for (int o = 0; o < out_n; o++) {
         const unsigned char* row = W + (size_t)o * n_blocks * block_bytes;
         float acc = 0.0f;
@@ -155,14 +168,14 @@ void pickle_fast_matmul_q4_1(float* y,
             memcpy(&d, blk,     4);
             memcpy(&m, blk + 4, 4);
             const unsigned char* qs = blk + 8;
+            const float* xr = x + b * BS;
+            #pragma omp simd simdlen(16) reduction(+:acc)
             for (int i = 0; i < 16; i++) {
                 int lo = qs[i] & 0x0F;
                 int hi = (qs[i] >> 4) & 0x0F;
-                dq[i]      = d * (float)lo + m;
-                dq[16 + i] = d * (float)hi + m;
+                acc += (d * (float)lo + m) * xr[i];
+                acc += (d * (float)hi + m) * xr[16 + i];
             }
-            const float* xr = x + b * BS;
-            for (int i = 0; i < BS; i++) acc += dq[i] * xr[i];
         }
         y[o] = acc;
     }
@@ -177,7 +190,7 @@ void pickle_fast_matmul_q5_0(float* y,
     const int BS = 32;
     const size_t block_bytes = 22;
     int n_blocks = in_n / BS;
-    float dq[32];
+    #pragma omp parallel for schedule(static)
     for (int o = 0; o < out_n; o++) {
         const unsigned char* row = W + (size_t)o * n_blocks * block_bytes;
         float acc = 0.0f;
@@ -189,16 +202,16 @@ void pickle_fast_matmul_q5_0(float* y,
             uint32_t q5 = (uint32_t)qh[0] | ((uint32_t)qh[1] << 8) |
                           ((uint32_t)qh[2] << 16) | ((uint32_t)qh[3] << 24);
             float offset = d * -16.0f;
+            const float* xr = x + b * BS;
+            #pragma omp simd simdlen(16) reduction(+:acc)
             for (int i = 0; i < 16; i++) {
                 int lo = ql[i] & 0x0F;
                 int hi = (ql[i] >> 4) & 0x0F;
                 int b0 = ((q5 >> i)       & 1) << 4;
                 int b1 = ((q5 >> (16+i))  & 1) << 4;
-                dq[i]      = d * (float)(lo | b0) + offset;
-                dq[16 + i] = d * (float)(hi | b1) + offset;
+                acc += (d * (float)(lo | b0) + offset) * xr[i];
+                acc += (d * (float)(hi | b1) + offset) * xr[16 + i];
             }
-            const float* xr = x + b * BS;
-            for (int i = 0; i < BS; i++) acc += dq[i] * xr[i];
         }
         y[o] = acc;
     }
@@ -213,7 +226,7 @@ void pickle_fast_matmul_q5_1(float* y,
     const int BS = 32;
     const size_t block_bytes = 24;
     int n_blocks = in_n / BS;
-    float dq[32];
+    #pragma omp parallel for schedule(static)
     for (int o = 0; o < out_n; o++) {
         const unsigned char* row = W + (size_t)o * n_blocks * block_bytes;
         float acc = 0.0f;
@@ -226,16 +239,16 @@ void pickle_fast_matmul_q5_1(float* y,
             const unsigned char* ql = blk + 12;
             uint32_t q5 = (uint32_t)qh[0] | ((uint32_t)qh[1] << 8) |
                           ((uint32_t)qh[2] << 16) | ((uint32_t)qh[3] << 24);
+            const float* xr = x + b * BS;
+            #pragma omp simd simdlen(16) reduction(+:acc)
             for (int i = 0; i < 16; i++) {
                 int lo = ql[i] & 0x0F;
                 int hi = (ql[i] >> 4) & 0x0F;
                 int b0 = ((q5 >> i)       & 1) << 4;
                 int b1 = ((q5 >> (16+i))  & 1) << 4;
-                dq[i]      = d * (float)(lo | b0) + m;
-                dq[16 + i] = d * (float)(hi | b1) + m;
+                acc += (d * (float)(lo | b0) + m) * xr[i];
+                acc += (d * (float)(hi | b1) + m) * xr[16 + i];
             }
-            const float* xr = x + b * BS;
-            for (int i = 0; i < BS; i++) acc += dq[i] * xr[i];
         }
         y[o] = acc;
     }
@@ -250,7 +263,7 @@ void pickle_fast_matmul_q8_0(float* y,
     const int BS = 32;
     const size_t block_bytes = 34;
     int n_blocks = in_n / BS;
-    float dq[32];
+    #pragma omp parallel for schedule(static)
     for (int o = 0; o < out_n; o++) {
         const unsigned char* row = W + (size_t)o * n_blocks * block_bytes;
         float acc = 0.0f;
@@ -258,9 +271,9 @@ void pickle_fast_matmul_q8_0(float* y,
             const unsigned char* blk = row + (size_t)b * block_bytes;
             float d = f16_bits_to_float((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));
             const signed char* qs = (const signed char*)(blk + 2);
-            for (int i = 0; i < 32; i++) dq[i] = d * (float)qs[i];
             const float* xr = x + b * BS;
-            for (int i = 0; i < BS; i++) acc += dq[i] * xr[i];
+            #pragma omp simd simdlen(16) reduction(+:acc)
+            for (int i = 0; i < 32; i++) acc += d * (float)qs[i] * xr[i];
         }
         y[o] = acc;
     }
@@ -275,7 +288,7 @@ void pickle_fast_matmul_q8_1(float* y,
     const int BS = 32;
     const size_t block_bytes = 36;
     int n_blocks = in_n / BS;
-    float dq[32];
+    #pragma omp parallel for schedule(static)
     for (int o = 0; o < out_n; o++) {
         const unsigned char* row = W + (size_t)o * n_blocks * block_bytes;
         float acc = 0.0f;
@@ -284,9 +297,9 @@ void pickle_fast_matmul_q8_1(float* y,
             float d;
             memcpy(&d, blk, 4);
             const signed char* qs = (const signed char*)(blk + 8);
-            for (int i = 0; i < 32; i++) dq[i] = d * (float)qs[i];
             const float* xr = x + b * BS;
-            for (int i = 0; i < BS; i++) acc += dq[i] * xr[i];
+            #pragma omp simd simdlen(16) reduction(+:acc)
+            for (int i = 0; i < 32; i++) acc += d * (float)qs[i] * xr[i];
         }
         y[o] = acc;
     }
@@ -333,7 +346,11 @@ void pickle_fast_matmul_q4_k(float* y,
     const int BS = 256;
     const size_t block_bytes = 144;
     int n_blocks = in_n / BS;
-    float dq[256];
+    /* Fused dequant+dot: instead of staging 256 floats to a stack
+     * buffer and then dot-producting, we accumulate straight into acc
+     * as each element is dequanted. Saves 1KB of stack traffic per
+     * block and keeps partials in registers across the dot. */
+    #pragma omp parallel for schedule(static)
     for (int o = 0; o < out_n; o++) {
         const unsigned char* row = W + (size_t)o * n_blocks * block_bytes;
         float acc = 0.0f;
@@ -343,6 +360,7 @@ void pickle_fast_matmul_q4_k(float* y,
             float dmin = f16_bits_to_float((uint16_t)blk[2] | ((uint16_t)blk[3] << 8));
             const unsigned char* sc = blk + 4;
             const unsigned char* q  = blk + 16;
+            const float* xr = x + b * BS;
             /* GGML chunked layout: 4 chunks of 64 elements, 32 bytes of qs each. */
             int is = 0;
             for (int j = 0; j < 256; j += 64) {
@@ -351,15 +369,14 @@ void pickle_fast_matmul_q4_k(float* y,
                 qk_get_scale_min_k4(is + 1, sc, &sc1, &m1);
                 float d1 = d * (float)sc0, m1f = dmin * (float)m0;
                 float d2 = d * (float)sc1, m2f = dmin * (float)m1;
+                #pragma omp simd simdlen(16) reduction(+:acc)
                 for (int l = 0; l < 32; l++) {
-                    dq[j + l]      = d1 * (float)(q[l] & 0x0F) - m1f;
-                    dq[j + l + 32] = d2 * (float)(q[l] >> 4)   - m2f;
+                    acc += (d1 * (float)(q[l] & 0x0F) - m1f) * xr[j + l];
+                    acc += (d2 * (float)(q[l] >> 4)   - m2f) * xr[j + l + 32];
                 }
                 q += 32;
                 is += 2;
             }
-            const float* xr = x + b * BS;
-            for (int i = 0; i < BS; i++) acc += dq[i] * xr[i];
         }
         y[o] = acc;
     }
@@ -388,7 +405,7 @@ void pickle_fast_matmul_q5_k(float* y,
     const int BS = 256;
     const size_t block_bytes = 176;
     int n_blocks = in_n / BS;
-    float dq[256];
+    #pragma omp parallel for schedule(static)
     for (int o = 0; o < out_n; o++) {
         const unsigned char* row = W + (size_t)o * n_blocks * block_bytes;
         float acc = 0.0f;
@@ -399,6 +416,7 @@ void pickle_fast_matmul_q5_k(float* y,
             const unsigned char* sc = blk + 4;
             const unsigned char* qh = blk + 16;
             const unsigned char* ql = blk + 48;
+            const float* xr = x + b * BS;
             int is = 0;
             uint8_t u1 = 1, u2 = 2;  /* bit masks for the 5th bit, shift per chunk */
             for (int j = 0; j < 256; j += 64) {
@@ -407,19 +425,18 @@ void pickle_fast_matmul_q5_k(float* y,
                 qk_get_scale_min_k4(is + 1, sc, &sc1, &m1);
                 float d1 = d * (float)sc0, m1f = dmin * (float)m0;
                 float d2 = d * (float)sc1, m2f = dmin * (float)m1;
+                #pragma omp simd simdlen(16) reduction(+:acc)
                 for (int l = 0; l < 32; l++) {
                     int q0 = (ql[l] & 0x0F) + ((qh[l] & u1) ? 16 : 0);
                     int q1 = (ql[l] >> 4)   + ((qh[l] & u2) ? 16 : 0);
-                    dq[j + l]      = d1 * (float)q0 - m1f;
-                    dq[j + l + 32] = d2 * (float)q1 - m2f;
+                    acc += (d1 * (float)q0 - m1f) * xr[j + l];
+                    acc += (d2 * (float)q1 - m2f) * xr[j + l + 32];
                 }
                 ql += 32;
                 is += 2;
                 u1 <<= 2;
                 u2 <<= 2;
             }
-            const float* xr = x + b * BS;
-            for (int i = 0; i < BS; i++) acc += dq[i] * xr[i];
         }
         y[o] = acc;
     }
@@ -445,7 +462,7 @@ void pickle_fast_matmul_q6_k(float* y,
     const int BS = 256;
     const size_t block_bytes = 210;
     int n_blocks = in_n / BS;
-    float dq[256];
+    #pragma omp parallel for schedule(static)
     for (int o = 0; o < out_n; o++) {
         const unsigned char* row = W + (size_t)o * n_blocks * block_bytes;
         float acc = 0.0f;
@@ -455,21 +472,49 @@ void pickle_fast_matmul_q6_k(float* y,
             const unsigned char* qh     = blk + 128;
             const signed char*   scales = (const signed char*)(blk + 192);
             float d = f16_bits_to_float((uint16_t)blk[208] | ((uint16_t)blk[209] << 8));
-            for (int i = 0; i < 256; i++) {
-                int chunk  = i >> 7;          /* i / 128 */
-                int within = i & 127;         /* i % 128 */
-                int sub    = within >> 5;     /* within / 32, range 0..3 */
-                int l      = within & 31;     /* within % 32 */
-                int ql_byte = chunk*64 + (sub & 1)*32 + l;
-                int q_lo = (ql[ql_byte] >> (4 * (sub >> 1))) & 0x0F;
-                int qh_byte = chunk*32 + l;
-                int q_hi = (qh[qh_byte] >> (2 * sub)) & 0x03;
-                int q = q_lo | (q_hi << 4);
-                q -= 32;   /* offset to signed (-32..31) */
-                dq[i] = d * (float)scales[i / 16] * (float)q;
-            }
             const float* xr = x + b * BS;
-            for (int i = 0; i < BS; i++) acc += dq[i] * xr[i];
+            /* Restructured to GGML's chunked 4-element form: per outer
+             * step we advance ql by 64, qh by 32, scales by 8, covering
+             * 128 elements (4 sub-blocks of 32 each). This is
+             * mathematically identical to the per-element form below
+             * (verified by element-index correspondence — see the
+             * VERIFY-Q6K worklog entry) but exposes 4 independent
+             * accumulations per inner iteration, giving the compiler a
+             * clean 4-wide reduction chain to vectorise. */
+            for (int n = 0; n < 256; n += 128) {
+                /* Split the l-loop into two 16-wide halves so the scale
+                 * index is loop-invariant within each half — the
+                 * compiler can then prove the scales[is+k] lookups are
+                 * invariant and vectorise the FMA chain. Note: ql/qh
+                 * still index by `l` (NOT l-16) — they are contiguous
+                 * across the 32-element inner range; only the SCALE
+                 * index changes at l=16. */
+                #pragma omp simd simdlen(16) reduction(+:acc)
+                for (int l = 0; l < 16; ++l) {
+                    const int q1 = (int)((ql[l +  0] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                    const int q2 = (int)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                    const int q3 = (int)((ql[l +  0]  >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                    const int q4 = (int)((ql[l + 32]  >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                    acc += d * (float)scales[0] * (float)q1 * xr[n + l +  0];
+                    acc += d * (float)scales[2] * (float)q2 * xr[n + l + 32];
+                    acc += d * (float)scales[4] * (float)q3 * xr[n + l + 64];
+                    acc += d * (float)scales[6] * (float)q4 * xr[n + l + 96];
+                }
+                #pragma omp simd simdlen(16) reduction(+:acc)
+                for (int l = 16; l < 32; ++l) {
+                    const int q1 = (int)((ql[l +  0] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                    const int q2 = (int)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                    const int q3 = (int)((ql[l +  0]  >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                    const int q4 = (int)((ql[l + 32]  >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                    acc += d * (float)scales[1] * (float)q1 * xr[n + l +  0];
+                    acc += d * (float)scales[3] * (float)q2 * xr[n + l + 32];
+                    acc += d * (float)scales[5] * (float)q3 * xr[n + l + 64];
+                    acc += d * (float)scales[7] * (float)q4 * xr[n + l + 96];
+                }
+                ql     += 64;
+                qh     += 32;
+                scales += 8;
+            }
         }
         y[o] = acc;
     }
@@ -484,7 +529,7 @@ void pickle_fast_matmul_q8_k(float* y,
     const int BS = 256;
     const size_t block_bytes = 292;
     int n_blocks = in_n / BS;
-    float dq[256];
+    #pragma omp parallel for schedule(static)
     for (int o = 0; o < out_n; o++) {
         const unsigned char* row = W + (size_t)o * n_blocks * block_bytes;
         float acc = 0.0f;
@@ -495,14 +540,14 @@ void pickle_fast_matmul_q8_k(float* y,
             const signed char* qs     = (const signed char*)(blk + 4);
             const float*       dsubs  = (const float*)(blk + 4 + 256);
             const float*       scales = (const float*)(blk + 4 + 256 + 16);
+            const float* xr = x + b * BS;
+            #pragma omp simd simdlen(16) reduction(+:acc)
             for (int i = 0; i < 256; i++) {
                 int sub = i / 64;
                 float sub_d   = d * scales[sub];
                 float sub_off = dsubs[sub];
-                dq[i] = sub_d * (float)qs[i] + sub_off;
+                acc += (sub_d * (float)qs[i] + sub_off) * xr[i];
             }
-            const float* xr = x + b * BS;
-            for (int i = 0; i < BS; i++) acc += dq[i] * xr[i];
         }
         y[o] = acc;
     }
@@ -517,7 +562,7 @@ void pickle_fast_matmul_q2_k(float* y,
     const int BS = 256;
     const size_t block_bytes = 84;
     int n_blocks = in_n / BS;
-    float dq[256];
+    #pragma omp parallel for schedule(static)
     for (int o = 0; o < out_n; o++) {
         const unsigned char* row = W + (size_t)o * n_blocks * block_bytes;
         float acc = 0.0f;
@@ -539,16 +584,16 @@ void pickle_fast_matmul_q2_k(float* y,
                     scales[g*8 + j] = v;
                 }
             }
+            const float* xr = x + b * BS;
+            #pragma omp simd simdlen(16) reduction(+:acc)
             for (int i = 0; i < 256; i++) {
                 int byte_idx = i / 4;
                 int bit_off  = 2 * (i & 3);
                 int q = (qs[byte_idx] >> bit_off) & 0x03;
                 int sub = i / 16;
                 float sv = d * (float)scales[sub] * (float)q;
-                dq[i] = sv - dmin;
+                acc += (sv - dmin) * xr[i];
             }
-            const float* xr = x + b * BS;
-            for (int i = 0; i < BS; i++) acc += dq[i] * xr[i];
         }
         y[o] = acc;
     }
@@ -563,7 +608,7 @@ void pickle_fast_matmul_q3_k(float* y,
     const int BS = 256;
     const size_t block_bytes = 110;
     int n_blocks = in_n / BS;
-    float dq[256];
+    #pragma omp parallel for schedule(static)
     for (int o = 0; o < out_n; o++) {
         const unsigned char* row = W + (size_t)o * n_blocks * block_bytes;
         float acc = 0.0f;
@@ -581,6 +626,8 @@ void pickle_fast_matmul_q3_k(float* y,
                 if (v & 0x20) v -= 64;
                 ks[i] = v;
             }
+            const float* xr = x + b * BS;
+            #pragma omp simd simdlen(16) reduction(+:acc)
             for (int i = 0; i < 256; i++) {
                 int byte_idx = i / 4;
                 int bit_off  = 2 * (i & 3);
@@ -589,10 +636,8 @@ void pickle_fast_matmul_q3_k(float* y,
                 if ((hmask[i / 8] >> (i % 8)) & 1) q += 4;
                 int sub = i / 32;
                 float sv = d * (float)ks[sub] * (float)q;
-                dq[i] = sv - dmin;
+                acc += (sv - dmin) * xr[i];
             }
-            const float* xr = x + b * BS;
-            for (int i = 0; i < BS; i++) acc += dq[i] * xr[i];
         }
         y[o] = acc;
     }
@@ -606,29 +651,38 @@ void pickle_fast_matmul_f16(float* y,
     /* Walk row by row, dequantizing each f16 to f32 on the fly. The
      * compiler vectorises the inner accumulation. */
     const uint16_t* W = (const uint16_t*)W_bytes;
-    /* Pre-convert one row's worth of f16 to f32 — stack buffer for
-     * small rows, heap for big ones. */
-    float* row32 = (float*)malloc((size_t)in_n * sizeof(float));
-    if (!row32) {
-        for (int o = 0; o < out_n; o++) y[o] = 0.0f;
-        return;
-    }
-    for (int o = 0; o < out_n; o++) {
-        const uint16_t* wrow = W + (size_t)o * in_n;
-        for (int i = 0; i < in_n; i++) row32[i] = f16_bits_to_float(wrow[i]);
-        float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
-        int i = 0;
-        int n4 = in_n & ~3;
-        for (; i < n4; i += 4) {
-            acc0 += row32[i]     * x[i];
-            acc1 += row32[i + 1] * x[i + 1];
-            acc2 += row32[i + 2] * x[i + 2];
-            acc3 += row32[i + 3] * x[i + 3];
+    /* Per-thread row32 buffer: allocate one inside a parallel region
+     * so each OpenMP thread gets its own scratch (the original code
+     * reused a single shared buffer, which is unsafe under
+     * #pragma omp parallel for). The 4-way unroll matches the F32 path
+     * and gives the compiler a clean reduction chain. */
+    #pragma omp parallel
+    {
+        float* row32 = (float*)malloc((size_t)in_n * sizeof(float));
+        if (row32) {
+            #pragma omp for schedule(static)
+            for (int o = 0; o < out_n; o++) {
+                const uint16_t* wrow = W + (size_t)o * in_n;
+                for (int i = 0; i < in_n; i++)
+                    row32[i] = f16_bits_to_float(wrow[i]);
+                float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+                int n4 = in_n & ~3;
+                #pragma omp simd simdlen(16) reduction(+:acc0,acc1,acc2,acc3)
+                for (int i = 0; i < n4; i += 4) {
+                    acc0 += row32[i]     * x[i];
+                    acc1 += row32[i + 1] * x[i + 1];
+                    acc2 += row32[i + 2] * x[i + 2];
+                    acc3 += row32[i + 3] * x[i + 3];
+                }
+                for (int i = n4; i < in_n; i++) acc0 += row32[i] * x[i];
+                y[o] = (acc0 + acc1) + (acc2 + acc3);
+            }
+            free(row32);
+        } else {
+            #pragma omp for schedule(static)
+            for (int o = 0; o < out_n; o++) y[o] = 0.0f;
         }
-        for (; i < in_n; i++) acc0 += row32[i] * x[i];
-        y[o] = (acc0 + acc1) + (acc2 + acc3);
     }
-    free(row32);
 }
 
 /* ----- Dispatch by tensor type ------------------------------------- */

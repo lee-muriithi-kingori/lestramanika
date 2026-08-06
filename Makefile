@@ -27,12 +27,12 @@
 CC      ?= cc
 CFLAGS  ?= -O3
 CFLAGS  += -Wall -Wextra \
-           -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function \
-           -Wno-strict-aliasing -Wno-aggressive-loop-optimizations \
-           -UPICKLE_KERNEL -Isrc
+	   -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function \
+	   -Wno-strict-aliasing -Wno-aggressive-loop-optimizations \
+	   -UPICKLE_KERNEL -Isrc
 # Enable native ISA so the compiler can auto-vectorise the fast-path
-# matmul/attention loops with SSE4.2 / AVX2 / FMA / F16C. Falls back
-# gracefully on older hosts (-march=native is widely supported).
+# matmul/attention loops with SSE4.2 / AVX2 / FMA / F16C / AVX-512. Falls
+# back gracefully on older hosts (-march=native is widely supported).
 # Override with `make PICKLE_NO_NATIVE=1` to disable (e.g. for reproducible
 # cross-arch builds).
 ifneq ($(PICKLE_NO_NATIVE),1)
@@ -40,27 +40,33 @@ ifneq ($(PICKLE_NO_NATIVE),1)
 endif
 LDFLAGS ?=
 LDLIBS  ?= -lm
+# OpenMP for multi-threaded matmul (2x on 2 cores, scales with core count).
+# Override with `make PICKLE_NO_OMP=1` to disable.
+ifneq ($(PICKLE_NO_OMP),1)
+	CFLAGS  += -fopenmp
+	LDFLAGS += -fopenmp
+endif
 
 # ---- object files --------------------------------------------------
 PICKLE_CORE_OBJS = \
-        src/pickle.o \
-        src/pickle_softfp.o \
-        src/pickle_demo_gguf.o
+	src/pickle.o \
+	src/pickle_softfp.o \
+	src/pickle_demo_gguf.o
 
 # Host-only fast path: native float math + quantized matmul + BPE tokenizer.
 PICKLE_FAST_OBJS = \
-        src/pickle_fast.o \
-        src/pickle_tokenizer.o
+	src/pickle_fast.o \
+	src/pickle_tokenizer.o
 
 CLI_OBJS = \
-        $(PICKLE_CORE_OBJS) \
-        $(PICKLE_FAST_OBJS) \
-        src/pickle_host.o \
-        src/pickle_cli.o
+	$(PICKLE_CORE_OBJS) \
+	$(PICKLE_FAST_OBJS) \
+	src/pickle_host.o \
+	src/pickle_cli.o
 
 SELFTEST_OBJS = \
-        $(PICKLE_CORE_OBJS) \
-        src/pickle_selftest_main.o
+	$(PICKLE_CORE_OBJS) \
+	src/pickle_selftest_main.o
 
 # ---- top-level targets ---------------------------------------------
 .PHONY: all clean test pickle pickle_selftest bench
