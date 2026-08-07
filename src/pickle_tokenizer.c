@@ -1,6 +1,6 @@
 /*
  * Lestra OS — Pickle Llama BPE tokenizer.
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Reads the standard Llama / SentencePiece BPE vocab from GGUF
  * metadata and implements encode + decode with byte-fallback.

@@ -1,6 +1,6 @@
 /*
  * Lestra OS — Pickle host fast path implementation.
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Host-only native-float math: matmul (F32 + every common quant),
  * RMSNorm, attention, RoPE, contiguous KV cache, BPE tokenizer, fast

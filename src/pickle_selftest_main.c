@@ -1,6 +1,6 @@
 /*
  * pickle_selftest_main.c — tiny main() for the standalone selftest binary.
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Just calls pickle_selftest() on the embedded demo GGUF and prints the
  * result. Mirrors the in-kernel boot-time selftest path so a host user

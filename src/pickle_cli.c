@@ -1,6 +1,6 @@
 /*
  * pickle_cli.c — host CLI frontend for the pickle GGUF engine.
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Subcommands:
  *

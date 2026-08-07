@@ -112,7 +112,7 @@ is built (mirrors the in-kernel boot-time selftest path).
 ## Repository layout (actual)
 
 ```
-lestramanika/
+picklestramk/
 ├── Makefile                       # builds ./pickle and ./pickle_selftest
 ├── src/                           # the pickle engine source
 │   ├── pickle.h                   #   public API (freestanding)

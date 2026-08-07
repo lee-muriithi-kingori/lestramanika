@@ -1,6 +1,6 @@
 /*
  * pickle_host.c — POSIX shim for the pickle GGUF engine.
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * Bridges the freestanding pickle core (pickle.c / pickle_softfp.c /
  * pickle.h — the SAME source that compiles into the lestraOS kernel with

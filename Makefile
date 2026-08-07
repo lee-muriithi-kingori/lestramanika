@@ -1,5 +1,5 @@
 # Makefile for the pickle GGUF engine — host (POSIX) build.
-# Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+# Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
 #
 # The SAME src/pickle.c / src/pickle_softfp.c / src/pickle.h source also
 # compiles into the lestraOS kernel (with -DPICKLE_KERNEL). Here we build

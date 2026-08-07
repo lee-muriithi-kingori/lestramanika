@@ -168,7 +168,7 @@ size = os.path.getsize(out_gguf)
 print(f"Wrote {out_gguf} ({size} bytes)")
 
 # ---- emit C array ---------------------------------------------------
-# Default output path is relative to the lestramanika repo root: the
+# Default output path is relative to the picklestramk repo root: the
 # source tree lives under src/, so the generated C array goes there too.
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 out_c = sys.argv[1] if len(sys.argv) > 1 else os.path.join(repo_root, 'src', 'pickle_demo_gguf.c')

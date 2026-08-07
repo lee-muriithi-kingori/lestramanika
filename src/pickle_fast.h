@@ -1,6 +1,6 @@
 /*
  * Lestra OS — Pickle host fast path.
- * Copyright (c) 2026 lestramk.org / Lee Muriihi Kingori
+ * Copyright (c) 2026 lestramk.org / Lee Muriithi Kingori
  *
  * This header declares the host-only "fast" API: native C float arithmetic
  * (SSE/AVX auto-vectorised by the compiler), a real Llama BPE tokenizer,
