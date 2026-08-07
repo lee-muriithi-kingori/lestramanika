@@ -23,10 +23,16 @@
 
 #ifndef PICKLE_KERNEL
 #include "pickle.h"
+#include <stdio.h>   /* FILE* for pickle_io_init_file declaration */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Host-only POSIX shim: wire up a pickle_io_t to a FILE*. Used by
+ * pickle_fast_state_init to dequantize the embedding from mmap'd raw
+ * bytes via fmemopen + pickle_dequant_stream. */
+void pickle_io_init_file(pickle_io_t* io, FILE* f);
 
 /* ------------------------------------------------------------------ */
 /* Precomputed per-model inference state                              */
@@ -110,6 +116,10 @@ typedef struct {
     float* down;     /* [hidden_dim]              — FFN down projection */
     float* scores;   /* [max_seq]                 — attention score scratch */
     float* emb_row;  /* [hidden_dim]              — per-row F16 embd dequant */
+    float* dequant_embd; /* host: F32 copy of token_embd when it was
+                           * quantized and loaded via mmap (mmap patches
+                           * t->data to raw quant bytes, but the forward
+                           * pass reads embd as F32). NULL if not needed. */
 } pickle_fast_state_t;
 
 /* Build the fast-state from a loaded model + detected arch. Returns

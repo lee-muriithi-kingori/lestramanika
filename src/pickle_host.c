@@ -70,7 +70,7 @@ static int64_t host_io_tell(void* ctx) {
     return (int64_t)p;
 }
 
-static void pickle_io_init_file(pickle_io_t* io, FILE* f) {
+void pickle_io_init_file(pickle_io_t* io, FILE* f) {
     io->ctx   = (void*)f;
     io->read  = host_io_read;
     io->seek  = host_io_seek;

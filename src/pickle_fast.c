@@ -1532,23 +1532,66 @@ int pickle_fast_state_init(const pickle_model_t* m,
     state->t_output = pickle_tensor_find(m, "output.weight");
     if (state->t_embd < 0) { pickle_fast_state_free(state); return PICKLE_ERR_ARCH; }
 
-    /* If the embedding tensor hasn't been loaded yet (lazy load), load
-     * it now. For F32/F16 we load raw (the fast path reads both
-     * natively). For any other quant, we dequantize to F32 (the fast
-     * path's per-row embd lookup only handles F32/F16 inline). */
-    if (state->tensors[state->t_embd].data == NULL) {
+    /* Ensure the embedding tensor is F32 (or F16, which the forward
+     * path dequants per-row). Two cases:
+     *
+     *   1. data == NULL (lazy/meta load): load via io. F32/F16 -> raw,
+     *      anything else -> dequant_tensor (allocates F32).
+     *
+     *   2. data != NULL but type is quantized (mmap case): the mmap
+     *      patches t->data to point at the RAW quant bytes, but the
+     *      forward pass reads the embd as F32 (per-row lookup). We
+     *      must dequantize from the mmap'd raw bytes into a fresh F32
+     *      buffer, then patch the state's tensor copy.
+     *      pickle_dequant_tensor() can't help -- it sees data != NULL
+     *      and returns immediately, and m->io is NULL (detached by
+     *      pickle_attach_mmap). So we do it manually with fmemopen.
+     */
+    {
         int emb_type_local = state->tensors[state->t_embd].type;
-        int drc;
-        if (emb_type_local == GGML_F32 || emb_type_local == GGML_F16) {
-            drc = pickle_load_tensor_raw((pickle_model_t*)m, (size_t)state->t_embd);
-        } else {
-            drc = pickle_dequant_tensor((pickle_model_t*)m, (size_t)state->t_embd);
-        }
-        if (drc != PICKLE_OK) { pickle_fast_state_free(state); return drc; }
-        if (pickle_tensor_info(m, (size_t)state->t_embd,
-                               &state->tensors[state->t_embd]) != PICKLE_OK) {
-            pickle_fast_state_free(state);
-            return PICKLE_ERR_FORMAT;
+        if (emb_type_local != GGML_F32 && emb_type_local != GGML_F16) {
+            /* Quantized embedding -- need F32 copy for the forward path. */
+            if (state->tensors[state->t_embd].data == NULL) {
+                /* Case 1: lazy load -- dequant via io. */
+                int drc = pickle_dequant_tensor((pickle_model_t*)m,
+                                                (size_t)state->t_embd);
+                if (drc != PICKLE_OK) { pickle_fast_state_free(state); return drc; }
+                if (pickle_tensor_info(m, (size_t)state->t_embd,
+                                       &state->tensors[state->t_embd]) != PICKLE_OK) {
+                    pickle_fast_state_free(state); return PICKLE_ERR_FORMAT;
+                }
+            } else {
+                /* Case 2: mmap'd raw quant bytes -- dequant in-place
+                 * into a fresh F32 buffer using fmemopen. */
+                uint64_t n_el = state->tensors[state->t_embd].n_elements;
+                size_t f32_bytes = (size_t)n_el * sizeof(float);
+                float* f32_buf = (float*)malloc(f32_bytes);
+                if (!f32_buf) { pickle_fast_state_free(state); return PICKLE_ERR_MEMORY; }
+                FILE* mf = fmemopen(state->tensors[state->t_embd].data,
+                                    state->tensors[state->t_embd].data_size, "rb");
+                if (!mf) { free(f32_buf); pickle_fast_state_free(state);
+                           return PICKLE_ERR_IO; }
+                pickle_io_t io;
+                pickle_io_init_file(&io, mf);
+                int drc = pickle_dequant_stream(&io, (uint32_t)emb_type_local,
+                                                n_el, f32_buf);
+                fclose(mf);
+                if (drc != PICKLE_OK) {
+                    free(f32_buf); pickle_fast_state_free(state); return drc;
+                }
+                state->dequant_embd = f32_buf;
+                state->tensors[state->t_embd].data = f32_buf;
+                state->tensors[state->t_embd].type = GGML_F32;
+            }
+        } else if (state->tensors[state->t_embd].data == NULL) {
+            /* F32/F16, not yet loaded -- load raw. */
+            int drc = pickle_load_tensor_raw((pickle_model_t*)m,
+                                             (size_t)state->t_embd);
+            if (drc != PICKLE_OK) { pickle_fast_state_free(state); return drc; }
+            if (pickle_tensor_info(m, (size_t)state->t_embd,
+                                   &state->tensors[state->t_embd]) != PICKLE_OK) {
+                pickle_fast_state_free(state); return PICKLE_ERR_FORMAT;
+            }
         }
     }
 
@@ -1722,6 +1765,7 @@ void pickle_fast_state_free(pickle_fast_state_t* state) {
     free(state->down);
     free(state->scores);
     free(state->emb_row);
+    free(state->dequant_embd);
     memset(state, 0, sizeof(*state));
 }
 
