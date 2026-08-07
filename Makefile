@@ -45,6 +45,12 @@ LDLIBS  ?= -lm
 ifneq ($(PICKLE_NO_OMP),1)
 	CFLAGS  += -fopenmp
 	LDFLAGS += -fopenmp
+else
+	# Without -fopenmp the `#pragma omp parallel`/`#pragma omp simd`
+	# directives in pickle_fast.c become no-ops; silence the
+	# -Wunknown-pragmas noise so the portable (kernel-style) build
+	# stays warning-clean.
+	CFLAGS  += -Wno-unknown-pragmas
 endif
 
 # ---- object files --------------------------------------------------

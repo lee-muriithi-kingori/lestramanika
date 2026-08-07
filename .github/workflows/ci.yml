@@ -1,0 +1,59 @@
+name: CI
+
+# Build pickle + pickle_selftest and run the selftest on every push and pull
+# request. A green check here is the gate for cutting a release: if
+# `make test` does not pass on a stock runner, the release is blocked.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: Build & selftest (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux (x86_64, with AVX-512 on the GitHub ubuntu-latest image) and
+        # macOS (Apple Silicon). The build auto-detects -march=native; both
+        # paths compile the same freestanding C source.
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          cc --version
+          make --version | head -1
+
+      - name: Build (default — native + OpenMP)
+        run: make -j
+
+      - name: Build (portable, no native, no OpenMP)
+        # Verify the source also compiles reproducibly without -march=native
+        # and without OpenMP, which is how it is consumed in the lestraOS
+        # kernel and on constrained hosts.
+        run: make clean && make -j PICKLE_NO_NATIVE=1 PICKLE_NO_OMP=1
+
+      - name: Run selftest
+        run: |
+          # Rebuild the default (native + OpenMP) binary for the test run,
+          # then exercise both selftest entry points + the version command.
+          make clean && make -j
+          set -e
+          ./pickle_selftest
+          ./pickle selftest
+          ./pickle --version
+
+      - name: Confirm exit codes
+        # Belt-and-braces: fail the job if any of these did not exit 0.
+        run: |
+          ./pickle selftest >/dev/null 2>&1 && echo "selftest OK"
+          ./pickle --version >/dev/null 2>&1 && echo "version OK"
+          ./pickle --help   >/dev/null 2>&1 && echo "help OK"

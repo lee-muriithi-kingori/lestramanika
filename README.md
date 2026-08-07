@@ -68,6 +68,7 @@ llama.cpp/ollama without sharing any code with them.</p></li>
   <li><a href="#bench">bench</a></li>
   <li><a href="#tokens">tokens</a></li>
   <li><a href="#dequant">dequant</a></li>
+  <li><a href="#version">version</a></li>
   <li><a href="#common-options">Common options</a></li>
   <li><a href="#exit-codes">Exit codes</a></li>
   </ul>
@@ -92,11 +93,19 @@ llama.cpp/ollama without sharing any code with them.</p></li>
 
 ## Status
 
-<p><strong>v0.4 alpha.</strong> The Llama-family forward pass is verified
+<p><strong>v1.0.0 stable.</strong> The Llama-family forward pass is verified
 end-to-end both in-kernel (lestraOS boot-time selftest, KE-28) and on the
 host (<code>./pickle selftest</code>, <code>./pickle infer</code>,
 <code>./pickle chat</code>, <code>./pickle bench</code>,
-<code>./pickle tokens</code>).</p>
+<code>./pickle tokens</code>). The single-sequence path, the BPE tokenizer,
+and the full CLI are now frozen for the 1.x line &mdash; see
+<a href="#stability">stability guarantees</a> and
+<a href="CHANGELOG.md"><code>CHANGELOG.md</code></a>.</p>
+
+<p>Continuous integration builds and selftests pickle on every push and pull
+request &mdash; see <a href=".github/workflows/ci.yml"><code>.github/workflows/ci.yml</code></a>.
+For build/test guidance see <a href="CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a>;
+for security reports see <a href="SECURITY.md"><code>SECURITY.md</code></a>.</p>
 
 <p>Roadmap progress (see <a href="docs/ROADMAP.md"><code>docs/ROADMAP.md</code></a>):</p>
 
@@ -129,8 +138,8 @@ host (<code>./pickle selftest</code>, <code>./pickle infer</code>,
 <td>Next</td>
 </tr>
 <tr>
-<td>v1.0 &mdash; First stable release</td>
-<td>Planned</td>
+<td>v1.0 &mdash; First stable release (CLI + API frozen for the 1.x line)</td>
+<td><strong>Done</strong></td>
 </tr>
 </tbody>
 </table>
@@ -542,6 +551,7 @@ Usage:
   pickle tokens &lt;model.gguf&gt; encode "&lt;text&gt;"      BPE-encode text -&gt; token ids
   pickle tokens &lt;model.gguf&gt; decode &lt;id...&gt;        Decode token ids -&gt; text
   pickle dequant &lt;model.gguf&gt; &lt;tensor&gt;            Print first 32 floats of &lt;tensor&gt;
+  pickle version | --version | -V                  Print version and exit
 
 Options (infer / chat / bench):
   --temp T     Temperature (default 0 = greedy)
@@ -644,6 +654,21 @@ its raw bytes from the <code>mmap</code>&rsquo;d region, dequantizes to F32,
 and prints the first 32 floats. Useful for cross-checking a dequantizer
 against a reference implementation (e.g. comparing Q4_K output against
 llama.cpp bit-for-bit on the same tensor).</p>
+
+<a id="version"></a>
+
+#### version
+
+<pre><code>pickle version
+pickle --version
+pickle -V
+</code></pre>
+
+<p>Any of the three forms prints the pickle version string (e.g.
+<samp>pickle 1.0.0</samp>) and exits <code>0</code>. The string is generated
+from <a href="src/version.h"><code>src/version.h</code></a> and is the single
+source of truth for which release you are running. It matches the most recent
+<code>v*</code> git tag.</p>
 
 </details>
 
@@ -840,6 +865,49 @@ for the integration guide.</p>
 
 <hr>
 
+<a id="stability"></a>
+
+## Stability guarantees (1.x line)
+
+<p>With <strong>v1.0.0</strong> the following surfaces are frozen for the
+whole 1.x line &mdash; they will not be removed or renamed, and behaviour
+will not change for existing valid input without a major version bump:</p>
+
+<ul>
+<li><p><strong>The CLI.</strong> The subcommands <code>selftest</code>,
+<code>info</code>, <code>infer</code>, <code>chat</code>, <code>bench</code>,
+<code>tokens</code>, <code>dequant</code>, and <code>version</code>, and the
+flags <code>--temp</code>, <code>--top-p</code>, <code>--seed</code>,
+<code>--max</code>, <code>--no-bos</code>, <code>--version</code> / <code>-V</code>,
+and <code>--help</code> / <code>-h</code>. New subcommands and flags may be
+added (minor bumps); existing ones keep their names, argument order, and
+defaults.</p></li>
+<li><p><strong>The <code>pickle_core</code> API</strong> declared in
+<a href="src/pickle.h"><code>src/pickle.h</code></a> &mdash; the model loader,
+architecture descriptor, and forward-pass entry points.</p></li>
+<li><p><strong>The host/fast APIs</strong> in
+<a href="src/pickle_fast.h"><code>src/pickle_fast.h</code></a>,
+<code>src/pickle_host.c</code>, and <code>src/pickle_tokenizer.c</code>
+&mdash; the mmap loader, the BPE tokenizer, and the streaming chat loop.</p></li>
+<li><p><strong>The supported tensor types</strong> (F32, F16, Q8_0, Q4_0,
+Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K, Q8_K, Q2_K, Q3_K) and the
+Llama-family forward pass (RMSNorm + GQA/RoPE + SwiGLU, greedy and
+temperature/top-p sampling).</p></li>
+</ul>
+
+<p>Explicitly <strong>not</strong> part of the 1.0 stability surface:
+batched prefill and continuous batching (tracked as v0.5 / a future 2.0),
+multi-turn chat context (each <code>chat</code> prompt is independent in
+1.x), and any build-time knob&rsquo;s default value other than the ones
+documented above.</p>
+
+<p>The version string reported by <code>./pickle --version</code> is the
+single source of truth and is generated from
+<a href="src/version.h"><code>src/version.h</code></a>. Per-release changes
+are recorded in <a href="CHANGELOG.md"><code>CHANGELOG.md</code></a>.</p>
+
+<hr>
+
 <a id="roadmap"></a>
 
 ## Roadmap
@@ -857,7 +925,7 @@ for the integration guide.</p>
 <tr><td>v0.3</td><td>Llama forward pass (RMSNorm, GQA+RoPE, SwiGLU, sampling)</td><td>Done</td></tr>
 <tr><td>v0.4</td><td>Llama BPE tokenizer with byte-fallback + streaming chat</td><td>Done</td></tr>
 <tr><td>v0.5</td><td>Batched prefill + continuous batching</td><td>Next</td></tr>
-<tr><td>v1.0</td><td>First stable release (API stability, reference model + test set)</td><td>Planned</td></tr>
+<tr><td>v1.0</td><td>First stable release (CLI + API frozen for the 1.x line)</td><td>Done</td></tr>
 </tbody>
 </table>
 

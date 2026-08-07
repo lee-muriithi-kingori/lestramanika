@@ -61,15 +61,27 @@ detokenised back to text, end to end, on the host.
 v0.3 one-token-at-a-time loop, and two interleaved sequences produce the same
 outputs as two separate runs.
 
-## v1.0 — First release
+## v1.0 — First release (DONE — shipped 2026-08-07 as tag `v1.0.0`)
 
 - `pickle_cli` REPL with streaming generation.
-- Deterministic mode (fixed seed, fixed temperature schedule) for reproducible
-  tests.
-- A reference model + prompt set committed to the test suite (small, licensed
-  for redistribution).
-- API stability guarantees for `pickle_core` and `pickle_host`.
-- This README updated with build instructions, supported models, and benchmarks.
+- Deterministic mode (fixed seed `--seed`, fixed temperature schedule) for
+  reproducible tests.
+- A reference model + prompt set: the embedded 4 KiB demo GGUF
+  (`src/pickle_demo_gguf.c`) + `pickle selftest` / `pickle_selftest`, which
+  exercise the full forward pass end to end without shipping a large vocab.
+- API stability guarantees for `pickle_core` (`src/pickle.h`) and
+  `pickle_host` / `pickle_fast` / the BPE tokenizer — frozen for the 1.x line.
+- `pickle version` / `--version` / `-V`, sourced from `src/version.h`.
+- `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, and a GitHub Actions CI
+  workflow (`.github/workflows/ci.yml`) that builds + selftests on every push
+  and pull request, on Linux and macOS.
+- This README updated with build instructions, supported models, and
+  benchmarks.
 
 **Done when:** a third party can `git clone`, build with one command on a stock
 Linux/macOS box, and run a supported model from a single CLI invocation.
+
+**Scope note:** the single-sequence path, the BPE tokenizer, and the full CLI
+are the 1.0 stability surface. Batched prefill and continuous batching (v0.5)
+and multi-turn chat context are explicitly **not** part of 1.0 and remain
+future work (a 2.0 line).

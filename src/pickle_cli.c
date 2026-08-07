@@ -41,10 +41,14 @@
  *       dequantization (legacy — uses the metadata-only load + on-
  *       demand dequant path).
  *
+ *   pickle version | --version | -V
+ *       Print the pickle version string and exit 0.
+ *
  * Exit codes: 0 on success, 1 on error.
  */
 #include "pickle.h"
 #include "pickle_fast.h"
+#include "version.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -112,6 +116,7 @@ static void usage(FILE* f) {
         "  pickle tokens <model.gguf> encode \"<text>\"      BPE-encode text → token ids\n"
         "  pickle tokens <model.gguf> decode <id...>        Decode token ids → text\n"
         "  pickle dequant <model.gguf> <tensor>            Print first 32 floats of <tensor>\n"
+        "  pickle version | --version | -V                  Print version and exit\n"
         "\n"
         "Options (infer / chat / bench):\n"
         "  --temp T     Temperature (default 0 = greedy)\n"
@@ -617,6 +622,11 @@ int main(int argc, char** argv) {
     if (strcmp(cmd, "dequant") == 0) {
         if (argc != 4) { usage(stderr); return 1; }
         return cmd_dequant(argv[2], argv[3]);
+    }
+    if (strcmp(cmd, "version") == 0 || strcmp(cmd, "--version") == 0 ||
+        strcmp(cmd, "-V") == 0) {
+        printf("%s\n", PICKLE_VERSION_STRING);
+        return 0;
     }
     if (strcmp(cmd, "-h") == 0 || strcmp(cmd, "--help") == 0 ||
         strcmp(cmd, "help") == 0) {
